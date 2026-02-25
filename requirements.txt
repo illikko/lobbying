@@ -12,5 +12,7 @@ sentence-transformers==3.0.1
 torch==2.4.1
 faiss-cpu==1.8.0.post1
 
-openai==1.40.6
+openai==1.63.0
 python-dotenv==1.0.1
+
+httpx==0.27.2
