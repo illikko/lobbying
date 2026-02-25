@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+
+scripts_local/
+*.bat
+
+# Environnements locaux
+.venv/
+venv/
+env/
+.conda/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Caches
+.ipynb_checkpoints/
+.cache/
+
+# Temp artifacts
+artifacts/*.tmp
+artifacts/*.json.tmp
+
+# Raw data (ne pas versionner)
+data/raw/
+*.xlsx
+*.csv
+
+# Temp artifacts
+artifacts/*.tmp
+artifacts/*.json.tmp
+
+# Caches
+.ipynb_checkpoints/
+.cache/
