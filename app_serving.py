@@ -90,7 +90,7 @@ with st.expander("Version artefacts", expanded=False):
     st.json(manifest or {"info": "manifest.json manquant"})
 
 # --- UI
-tab_search, tab_synth = st.tabs(["Recherche", "Synthèse"])
+tab_search, = st.tabs(["Recherche"])
 
 with tab_search:
     st.markdown("### Recherche des activités de lobbying")
@@ -150,6 +150,10 @@ with tab_search:
         st.session_state.selected_results = None
         st.session_state.selected_lois = None
         st.session_state.last_query = query
+        if res is None:
+            st.warning("Aucun résultat (res = None). Lancez une recherche / vérifiez les filtres.")
+        else:
+            st.success(f"{len(res)} résultats")
 
     # 3) READ: on lit toujours depuis session_state (jamais depuis une variable locale fragile)
     res = st.session_state.get("results", None)
@@ -227,32 +231,6 @@ with tab_search:
 
         cand = cand.sort_values("hybrid_score", ascending=False).head(int(topn_laws))
         return cand
-
-    if submitted:
-        with st.spinner("Recherche…"):
-            res = hybrid_search_activites(
-                query=query,
-                df_activites_min=df_acts,
-                bm25_bundle=bm25_bundle,
-                faiss_bundle=faiss_bundle,
-                embed_query_fn=embed_query_fn,
-                k_bm25=400,
-                k_vec=400,
-                nprobe=int(nprobe),
-                alpha_vec=float(alpha_vec),
-                topn=int(topn),
-                year_range=year_range,
-                min_budget=float(min_budget),
-            )
-        st.session_state.results = res
-        st.session_state.selected_results = None # reset sélection à chaque nouvelle recherche
-        st.session_state.selected_lois = None
-        st.session_state.last_query = query
-
-        if res is None:
-            st.warning("Aucun résultat (res = None). Lancez une recherche / vérifiez les filtres.")
-        else:
-            st.success(f"{len(res)} résultats")
 
     res = st.session_state.get("results", None)
 
@@ -665,15 +643,14 @@ with tab_search:
 
     st.plotly_chart(figt, use_container_width=True)
 
-# synthèse par LLM        
-with tab_synth:
+    # synthèse par LLM        
     st.markdown("### Synthèse LLM")
 
     res = st.session_state.get("selected_results", None)
-if not isinstance(res, pd.DataFrame) or res.empty:
-    # fallback : si l’utilisateur n’a pas validé la sélection, on prend les résultats bruts
-    res = st.session_state.get("results", None)
-    
+    if not isinstance(res, pd.DataFrame) or res.empty:
+        # fallback : si l’utilisateur n’a pas validé la sélection, on prend les résultats bruts
+        res = st.session_state.get("results", None)
+        
     if not isinstance(res, pd.DataFrame) or res.empty:
         st.warning("Aucun résultat. Lance d'abord une recherche.")
         st.stop()
