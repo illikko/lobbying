@@ -98,14 +98,13 @@ with c1:
         10, 200, 20, 10,
         help="Définit le nombre maximum d'activités de lobbying affichées dans les résultats."
     )
-
 with c2:
     min_budget = st.slider(
         "Budget moyen/activité minimum (€)", 
         0, 5000, 0, 100,
         help="Filtre les activités de lobbying dont le budget moyen par activité (pour chaque organisation) est supérieur ou égal à ce montant. Cela permet de se concentrer sur les activités potentiellement plus significatives en termes d'influence."
     )
-
+    
 with c3:
     year_range = st.slider(
         "Période (année)", 
@@ -113,41 +112,23 @@ with c3:
         help="Filtre les activités de lobbying publiées dans cette plage d'années. Cela permet de se concentrer sur les activités récentes ou sur une période spécifique d'intérêt."
     )
 
-min_bm25 = 8.0
+min_bm25 = 8.0  
 min_vec  = 0.5
 nprobe = 16
 alpha_vec = 0.55
 fusion_mode = "rrf"
 rrf_k = 60
 
-submitted = st.button("Lancer", type="primary")
+res = pd.read_csv("df.csv", sep=";", encoding="utf-8")
 
-if submitted:
-    with st.spinner("Recherche…"):
-        res = hybrid_search_activites(
-            query=query,
-            df_activites_min=df_acts,
-            bm25_bundle=bm25_bundle,
-            faiss_bundle=faiss_bundle,
-            embed_query_fn=embed_query_fn,
-            k_bm25=400,
-            k_vec=400,
-            nprobe=int(nprobe),
-            alpha_vec=float(alpha_vec),
-            topn=int(topn),
-            year_range=year_range,
-            min_budget=float(min_budget),
-            fusion_mode=fusion_mode,
-            rrf_k=int(rrf_k),
-        )
-    st.session_state.results = res
-    st.session_state.selected_results = None
-    st.session_state.selected_lois = None
-    st.session_state.last_query = query
-    if res is None:
-        st.warning("Aucun résultat (res = None). Lancez une recherche / vérifiez les filtres.")
-    else:
-        st.success(f"{len(res)} résultats")
+st.session_state.results = res
+st.session_state.selected_results = None
+st.session_state.selected_lois = None
+st.session_state.last_query = query
+if res is None:
+    st.warning("Aucun résultat (res = None). Lancez une recherche / vérifiez les filtres.")
+else:
+    st.success(f"{len(res)} résultats")
 
 # 3) READ: on lit toujours depuis session_state (jamais depuis une variable locale fragile)
 res = st.session_state.get("results", None)
