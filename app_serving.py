@@ -455,8 +455,8 @@ else:
     cell["hover"] = (
         "<b>Organisation :</b> " + cell["denomination"].astype(str) +
         "<br><b>Domaine :</b> " + cell["domaines_list"].astype(str) +
-        "<br><b>Budget estimé sur la recherche (réparti) :</b> " + cell["budget_total"].round(0).astype(int).astype(str) +
-        "<br><b>Nb activités matching :</b> " + cell["nb_activites"].astype(int).astype(str) +
+        "<br><b>Budget estimé sur la recherche (réparti) :</b> " + cell["budget_total"].fillna(0).replace([np.inf, -np.inf], 0).round(0).astype(int).astype(str) +
+        "<br><b>Nb activités matching :</b> " + cell["nb_activites"].fillna(0).replace([np.inf, -np.inf], 0).astype(int).astype(str) +
         "<br><b>Score hybride moyen :</b> " + cell["hybrid_moy"].fillna(0).round(3).astype(str) +
         "<br><b>Objets :</b> " + cell["objets"].astype(str)
     )
