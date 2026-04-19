@@ -801,9 +801,10 @@ org_theme_llm = org_theme_llm.merge(
     how="left"
 )
 
+_denom = pd.to_numeric(org_theme_llm["budget_cumule_recherche"], errors="coerce").fillna(0)
 org_theme_llm["part_du_budget_recherche_org_pct"] = np.where(
-    org_theme_llm["budget_cumule_recherche"] > 0,
-    100 * org_theme_llm["budget_cumule_recherche_org_domaine"] / org_theme_llm["budget_cumule_recherche"],
+    _denom > 0,
+    100 * pd.to_numeric(org_theme_llm["budget_cumule_recherche_org_domaine"], errors="coerce").fillna(0) / _denom,
     0.0
 )
 
