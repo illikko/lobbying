@@ -221,6 +221,15 @@ def hybrid_search_lois_local(
     cand = cand.sort_values("hybrid_score", ascending=False).head(int(topn_laws))
     return cand
 
+def to_int64_safe(series: pd.Series) -> pd.Series:
+    """Convertit en Int64 en neutralisant les infinis."""
+    return (
+        pd.to_numeric(series, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .round(0)
+        .astype("Int64")
+    )
+
 res = st.session_state.get("results", None)
 
 if not isinstance(res, pd.DataFrame) or res.empty:
@@ -240,7 +249,12 @@ rest = [c for c in show.columns if c not in priority]
 show = show.loc[:, [c for c in priority if c in show.columns] + rest]
 for c in ["budget_total", "budget_moyen_activite"]:
     if c in show.columns:
-        show[c] = pd.to_numeric(show[c], errors="coerce").round(0).astype("Int64")
+        show[c] = (
+            pd.to_numeric(show[c], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)  # ← neutralise les infinis
+            .round(0)
+            .astype("Int64")
+        )
 
 
 
@@ -344,7 +358,7 @@ cols_int = [
 ]
 
 for col in cols_int:
-    org_search[col] = org_search[col].astype("Int64")
+    org_search[col] = to_int64_safe(org_search[col])
 
 org_search = org_search.sort_values("budget_estime_recherche", ascending=False)
 
@@ -760,7 +774,7 @@ org_llm["part_budget_recherche_pct"] = np.where(
 
 # Arrondis
 for col in ["budget_cumule_recherche", "budget_total_lobbying"]:
-    org_llm[col] = pd.to_numeric(org_llm[col], errors="coerce").round(0).astype("Int64")
+    org_llm[col] = to_int64_safe(org_llm[col])
 
 for col in ["nb_activites_matching", "nb_activites_total_org"]:
     org_llm[col] = pd.to_numeric(org_llm[col], errors="coerce").round(0).astype("Int64")
@@ -799,16 +813,12 @@ org_theme_llm["part_du_budget_total_recherche_pct"] = np.where(
     0.0
 )
 
-org_theme_llm["budget_cumule_recherche_org_domaine"] = (
-    pd.to_numeric(org_theme_llm["budget_cumule_recherche_org_domaine"], errors="coerce")
-    .round(0)
-    .astype("Int64")
+org_theme_llm["budget_cumule_recherche_org_domaine"] = to_int64_safe(
+    org_theme_llm["budget_cumule_recherche_org_domaine"]
 )
 
-org_theme_llm["nb_activites_matching_org_domaine"] = (
-    pd.to_numeric(org_theme_llm["nb_activites_matching_org_domaine"], errors="coerce")
-    .round(0)
-    .astype("Int64")
+org_theme_llm["nb_activites_matching_org_domaine"] = to_int64_safe(
+    org_theme_llm["nb_activites_matching_org_domaine"]
 )
 
 org_theme_llm["part_du_budget_recherche_org_pct"] = org_theme_llm["part_du_budget_recherche_org_pct"].round(1)
@@ -836,15 +846,13 @@ theme_llm["part_budget_recherche_pct"] = np.where(
     0.0
 )
 
-theme_llm["budget_cumule_recherche_domaine"] = (
-    pd.to_numeric(theme_llm["budget_cumule_recherche_domaine"], errors="coerce")
-    .round(0)
-    .astype("Int64")
+theme_llm["budget_cumule_recherche_domaine"] = to_int64_safe(
+    theme_llm["budget_cumule_recherche_domaine"]
 )
 
 theme_llm["part_budget_recherche_pct"] = theme_llm["part_budget_recherche_pct"].round(1)
-theme_llm["nb_organisations"] = pd.to_numeric(theme_llm["nb_organisations"], errors="coerce").astype("Int64")
-theme_llm["nb_activites_matching"] = pd.to_numeric(theme_llm["nb_activites_matching"], errors="coerce").astype("Int64")
+theme_llm["nb_organisations"] = to_int64_safe(theme_llm["nb_organisations"])
+theme_llm["nb_activites_matching"] = to_int64_safe(theme_llm["nb_activites_matching"])
 
 theme_llm = theme_llm.sort_values("budget_cumule_recherche_domaine", ascending=False)
 
