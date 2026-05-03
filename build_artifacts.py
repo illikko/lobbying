@@ -1,7 +1,6 @@
 from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from pathlib import Path
 import numpy as np
 import pandas as pd
 
@@ -23,17 +22,108 @@ class BuildConfig:
     m: int = 32
     nbits: int = 8
     normalize: bool = True
-    # BM25
-    # (no special config)
     # misc
     created_by: str = "build_artifacts.py"
+
 
 def _raw(p: str) -> str:
     return str((PATHS.data_raw / p).resolve())
 
+
+def _read_raw_xlsx(filename: str) -> pd.DataFrame:
+    """Lecture robuste des tables HATVP: les IDs doivent rester des chaînes."""
+    path = PATHS.data_raw / filename
+    if not path.exists():
+        raise FileNotFoundError(f"Fichier source manquant: {path}")
+    return pd.read_excel(path, dtype=str)
+
+
+def _norm_id_series(s: pd.Series) -> pd.Series:
+    return (
+        s.astype("string")
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+        .mask(lambda x: x.str.lower().isin(["", "nan", "none", "<na>"]))
+    )
+
+
+def _join_unique(values: pd.Series, max_items: int = 1000) -> str:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values.dropna().astype(str):
+        value = value.strip()
+        if not value or value.lower() in {"nan", "none", "<na>"}:
+            continue
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+        if len(out) >= max_items:
+            break
+    return "; ".join(out)
+
+
+def _explode_ids(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    out = df.copy()
+    out[col] = _norm_id_series(out[col])
+    out[col] = out[col].str.split(r"\s*[;,|]\s*", regex=True)
+    out = out.explode(col)
+    out[col] = _norm_id_series(out[col])
+    return out.dropna(subset=[col])
+
+
+def _add_categorie_to_activites(df_acts_min: pd.DataFrame, df_infos: pd.DataFrame) -> pd.DataFrame:
+    """Ajoute label_categorie_organisation dans l'artefact activités.
+
+    df_acts_min garde l'index activite_id. La clé fiable est representants_id quand elle existe.
+    """
+    out = df_acts_min.copy()
+    if "label_categorie_organisation" in out.columns:
+        return out
+    if "representants_id" not in out.columns or "representants_id" not in df_infos.columns:
+        return out
+    if "label_categorie_organisation" not in df_infos.columns:
+        return out
+
+    left = out.reset_index().rename(columns={out.index.name or "index": "activite_id"})
+    left = _explode_ids(left, "representants_id")
+
+    right = df_infos[["representants_id", "label_categorie_organisation"]].drop_duplicates().copy()
+    right = _explode_ids(right, "representants_id")
+    right["label_categorie_organisation"] = right["label_categorie_organisation"].astype("string").str.strip()
+    right = right.dropna(subset=["representants_id", "label_categorie_organisation"])
+
+    mapped = left[["activite_id", "representants_id"]].merge(right, on="representants_id", how="left")
+    cat_by_act = mapped.groupby("activite_id")["label_categorie_organisation"].agg(_join_unique)
+    out["label_categorie_organisation"] = out.index.astype(str).map(cat_by_act).astype("string")
+    return out
+
+
+def _normalise_auxiliary_tables(
+    df_affiliations: pd.DataFrame,
+    df_beneficiaires: pd.DataFrame,
+    df_observations: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Garde uniquement les colonnes utiles aux jointures côté app."""
+    aff = df_affiliations[["representants_id", "denomination_affiliation"]].copy()
+    aff = _explode_ids(aff, "representants_id")
+    aff["denomination_affiliation"] = aff["denomination_affiliation"].astype("string").str.strip()
+    aff = aff.dropna(subset=["representants_id", "denomination_affiliation"]).drop_duplicates()
+
+    benef = df_beneficiaires[["action_representation_interet_id", "beneficiaire_action_menee"]].copy()
+    benef["action_representation_interet_id"] = _norm_id_series(benef["action_representation_interet_id"])
+    benef["beneficiaire_action_menee"] = benef["beneficiaire_action_menee"].astype("string").str.strip()
+    benef = benef.dropna(subset=["action_representation_interet_id", "beneficiaire_action_menee"]).drop_duplicates()
+
+    obs = df_observations[["activite_id", "action_representation_interet_id"]].copy()
+    obs["activite_id"] = _norm_id_series(obs["activite_id"])
+    obs["action_representation_interet_id"] = _norm_id_series(obs["action_representation_interet_id"])
+    obs = obs.dropna(subset=["activite_id", "action_representation_interet_id"]).drop_duplicates()
+
+    return aff, benef, obs
+
+
 def build_all(cfg: BuildConfig) -> None:
-    
-    # 1) Prepare
+    # 1) Prepare coeur historique: activités, lois, BM25, FAISS.
     df_acts, df_lois = prepare_from_raw(
         xlsx_organisations=_raw("1_informations_generales.xlsx"),
         xlsx_activites=_raw("8_objets_activites.xlsx"),
@@ -43,9 +133,28 @@ def build_all(cfg: BuildConfig) -> None:
         csv_promulguees=_raw("promulguees.csv"),
     )
 
+    # 2) Nouvelles tables brutes HATVP, même snapshot que les autres fichiers.
+    df_infos = _read_raw_xlsx("1_informations_generales.xlsx")
+    df_affiliations_raw = _read_raw_xlsx("5_affiliations.xlsx")
+    df_beneficiaires_raw = _read_raw_xlsx("11_beneficiaires.xlsx")
+    df_observations_raw = _read_raw_xlsx("14_observations.xlsx")
+
+    df_affiliations, df_beneficiaires, df_observations = _normalise_auxiliary_tables(
+        df_affiliations_raw,
+        df_beneficiaires_raw,
+        df_observations_raw,
+    )
+
     df_acts = df_acts.sort_index()
     df_acts_min = minify_activites(df_acts)
+
+    # minify_activites ne gardait pas ces deux colonnes; elles sont nécessaires en production.
+    if "representants_id" in df_acts.columns:
+        df_acts_min["representants_id"] = _norm_id_series(df_acts["representants_id"])
+    df_acts_min = _add_categorie_to_activites(df_acts_min, df_infos)
+
     df_lois_min = minify_lois(df_lois)
+
     # --- Docs lois
     df_lois_min = df_lois_min.reset_index(drop=True)  # index propre 0..N
     docs_lois = build_docs_lois(df_lois_min)
@@ -58,7 +167,6 @@ def build_all(cfg: BuildConfig) -> None:
     bm25_lois_bundle = build_bm25(doc_ids=loi_ids, doc_texts=loi_texts)
     save_joblib(bm25_lois_bundle, ART.bm25_lois)
 
-
     # Ensure index is string activite_id
     df_acts_min.index = df_acts_min.index.astype(str)
 
@@ -66,16 +174,19 @@ def build_all(cfg: BuildConfig) -> None:
     doc_ids = docs["activite_id"].to_numpy(dtype=object)
     doc_texts = docs["doc_text"].fillna("").astype(str).tolist()
 
-    # 2) Save minified
+    # 3) Save minified + nouvelles tables propres.
     save_parquet(df_acts_min, ART.df_activites_min)
     save_parquet(df_lois_min, ART.df_lois_min)
     save_parquet(docs.set_index("activite_id"), ART.docs_activites)
+    save_parquet(df_affiliations, "df_affiliations.parquet")
+    save_parquet(df_beneficiaires, "df_beneficiaires.parquet")
+    save_parquet(df_observations, "df_observations.parquet")
 
-    # 3) BM25
+    # 4) BM25 activités
     bm25_bundle = build_bm25(doc_ids=doc_ids, doc_texts=doc_texts)
     save_joblib(bm25_bundle, ART.bm25_activites)
 
-    # 4) Embeddings + FAISS (ACTIVITES + LOIS)
+    # 5) Embeddings + FAISS (ACTIVITES + LOIS)
     model = SentenceTransformer(cfg.st_model)
 
     # --- Activités
@@ -88,7 +199,7 @@ def build_all(cfg: BuildConfig) -> None:
         nlist=cfg.nlist,
         m=cfg.m,
         nbits=cfg.nbits,
-        normalize=cfg.normalize
+        normalize=cfg.normalize,
     )
     save_faiss(faiss_bundle.index, ART.faiss_activites)
 
@@ -105,14 +216,14 @@ def build_all(cfg: BuildConfig) -> None:
         nlist=max(256, cfg.nlist // 4),
         m=cfg.m,
         nbits=cfg.nbits,
-        normalize=cfg.normalize
+        normalize=cfg.normalize,
     )
     save_faiss(faiss_lois_bundle.index, ART.faiss_lois)
 
     id_map_lois = pd.DataFrame({"pos": np.arange(len(loi_ids), dtype=int), "loi_id": loi_ids.astype(str)})
     save_parquet(id_map_lois.set_index("pos"), ART.id_map_lois)
 
-    # 5) manifest
+    # 6) manifest
     manifest = {
         "built_at": datetime.utcnow().isoformat() + "Z",
         "config": asdict(cfg),
@@ -120,6 +231,9 @@ def build_all(cfg: BuildConfig) -> None:
             "activites": int(df_acts_min.shape[0]),
             "lois": int(df_lois_min.shape[0]),
             "docs_activites": int(len(doc_texts)),
+            "affiliations": int(df_affiliations.shape[0]),
+            "beneficiaires": int(df_beneficiaires.shape[0]),
+            "observations": int(df_observations.shape[0]),
         },
         "files": {
             "df_activites_min": ART.df_activites_min,
@@ -128,9 +242,13 @@ def build_all(cfg: BuildConfig) -> None:
             "bm25_activites": ART.bm25_activites,
             "faiss_activites": ART.faiss_activites,
             "id_map_activites": ART.id_map_activites,
-        }
+            "df_affiliations": "df_affiliations.parquet",
+            "df_beneficiaires": "df_beneficiaires.parquet",
+            "df_observations": "df_observations.parquet",
+        },
     }
     write_manifest(manifest)
+
 
 if __name__ == "__main__":
     cfg = BuildConfig()

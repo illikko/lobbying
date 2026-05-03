@@ -61,6 +61,9 @@ def load_all():
     bm25_lois_bundle = load_joblib(ART.bm25_lois)
     faiss_lois_index = load_faiss(ART.faiss_lois)
     id_map_lois = load_parquet(ART.id_map_lois)
+    df_affiliations = load_parquet("df_affiliations.parquet")
+    df_beneficiaires = load_parquet("df_beneficiaires.parquet")
+    df_observations = load_parquet("df_observations.parquet")
 
     # rebuild FaissBundle doc_ids in index order
     doc_ids = id_map["activite_id"].astype(object).to_numpy()
@@ -72,14 +75,133 @@ def load_all():
     st_model = (manifest.get("config", {}) or {}).get("st_model", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
     embedder = SentenceTransformer(st_model)
 
-    return manifest, df_acts, df_lois, docs, bm25_bundle, faiss_bundle, bm25_lois_bundle, faiss_lois_bundle, embedder
+    return (
+        manifest, df_acts, df_lois, docs, bm25_bundle, faiss_bundle,
+        bm25_lois_bundle, faiss_lois_bundle, embedder,
+        df_affiliations, df_beneficiaires, df_observations,
+    )
 
-manifest, df_acts, df_lois, docs, bm25_bundle, faiss_bundle, bm25_lois_bundle, faiss_lois_bundle, embedder = load_all()
+(
+    manifest, df_acts, df_lois, docs, bm25_bundle, faiss_bundle,
+    bm25_lois_bundle, faiss_lois_bundle, embedder,
+    df_affiliations, df_beneficiaires, df_observations,
+) = load_all()
 
 def embed_query_fn(q: str) -> np.ndarray:
     q = "" if q is None else str(q)
     v = embedder.encode([q], convert_to_numpy=True)[0]
     return v.astype("float32", copy=False)
+
+
+def _norm_id_series(s: pd.Series) -> pd.Series:
+    return (
+        s.astype("string")
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+        .mask(lambda x: x.str.lower().isin(["", "nan", "none", "<na>"]))
+    )
+
+
+def _explode_ids(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    if df is None or df.empty or col not in df.columns:
+        return pd.DataFrame(columns=[] if df is None else list(df.columns))
+    out = df.copy()
+    out[col] = _norm_id_series(out[col])
+    out[col] = out[col].str.split(r"\s*[;,|]\s*", regex=True)
+    out = out.explode(col)
+    out[col] = _norm_id_series(out[col])
+    return out.dropna(subset=[col])
+
+
+def _join_unique(values, max_items: int = 80) -> str:
+    out = []
+    seen = set()
+    for value in pd.Series(values).dropna().astype(str):
+        value = value.strip()
+        if not value or value.lower() in {"nan", "none", "<na>"}:
+            continue
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+        if len(out) >= max_items:
+            break
+    if len(seen) > max_items:
+        out.append(f"… (+{len(seen) - max_items} autres)")
+    return "; ".join(out)
+
+
+def build_affiliations_organisations(org_search: pd.DataFrame) -> pd.DataFrame:
+    """Affiliations au niveau organisation: org_search.representants_id -> 5_affiliations."""
+    if org_search is None or org_search.empty:
+        return pd.DataFrame()
+    if "representants_id" not in org_search.columns:
+        return pd.DataFrame()
+    required = {"representants_id", "denomination_affiliation"}
+    if df_affiliations.empty or not required.issubset(df_affiliations.columns):
+        return pd.DataFrame()
+
+    org_ids = _explode_ids(org_search[["denomination", "representants_id"]].drop_duplicates(), "representants_id")
+    aff = df_affiliations[["representants_id", "denomination_affiliation"]].copy()
+    aff = _explode_ids(aff, "representants_id")
+    aff["denomination_affiliation"] = aff["denomination_affiliation"].astype("string").str.strip()
+    aff = aff.dropna(subset=["representants_id", "denomination_affiliation"]).drop_duplicates()
+
+    detail = org_ids.merge(aff, on="representants_id", how="inner")
+    if detail.empty:
+        return pd.DataFrame()
+
+    return (
+        detail.groupby("denomination", dropna=False)
+        .agg(
+            nb_affiliations=("denomination_affiliation", "nunique"),
+            denomination_affiliation=("denomination_affiliation", lambda s: _join_unique(s, max_items=120)),
+        )
+        .reset_index()
+        .sort_values(["nb_affiliations", "denomination"], ascending=[False, True])
+    )
+
+
+def build_beneficiaires_activites(selected_res: pd.DataFrame) -> pd.DataFrame:
+    """Bénéficiaires au niveau activité: activite_id -> observations -> beneficiaires."""
+    if selected_res is None or selected_res.empty:
+        return pd.DataFrame()
+    required_obs = {"activite_id", "action_representation_interet_id"}
+    required_ben = {"action_representation_interet_id", "beneficiaire_action_menee"}
+    if df_observations.empty or df_beneficiaires.empty:
+        return pd.DataFrame()
+    if not required_obs.issubset(df_observations.columns) or not required_ben.issubset(df_beneficiaires.columns):
+        return pd.DataFrame()
+
+    acts = selected_res.copy()
+    if "activite_id" not in acts.columns:
+        acts = acts.reset_index().rename(columns={"index": "activite_id"})
+    acts["activite_id"] = _norm_id_series(acts["activite_id"])
+
+    obs = df_observations[["activite_id", "action_representation_interet_id"]].copy()
+    obs["activite_id"] = _norm_id_series(obs["activite_id"])
+    obs["action_representation_interet_id"] = _norm_id_series(obs["action_representation_interet_id"])
+    obs = obs[obs["activite_id"].isin(set(acts["activite_id"].dropna()))].drop_duplicates()
+
+    benef = df_beneficiaires[["action_representation_interet_id", "beneficiaire_action_menee"]].copy()
+    benef["action_representation_interet_id"] = _norm_id_series(benef["action_representation_interet_id"])
+    benef["beneficiaire_action_menee"] = benef["beneficiaire_action_menee"].astype("string").str.strip()
+
+    detail = (
+        obs.merge(benef, on="action_representation_interet_id", how="inner")
+           .merge(acts[["activite_id", "denomination", "objet_activite"]].drop_duplicates(), on="activite_id", how="left")
+    )
+    if detail.empty:
+        return pd.DataFrame()
+
+    return (
+        detail.groupby(["denomination", "objet_activite"], dropna=False)
+        .agg(
+            nb_beneficiaires=("beneficiaire_action_menee", "nunique"),
+            beneficiaire_action_menee=("beneficiaire_action_menee", lambda s: _join_unique(s, max_items=80)),
+        )
+        .reset_index()
+        .sort_values(["nb_beneficiaires", "denomination"], ascending=[False, True])
+    )
 
 # --- UI
 st.markdown("### Recherche des activités de lobbying")
@@ -311,16 +433,18 @@ if "activite_id" not in df_tmp.columns:
 if "activite_id" not in df_tmp.columns:
     df_tmp["activite_id"] = df_tmp.index.astype(str)
 
-org_search = (
-    df_tmp.groupby("denomination", dropna=False)
-    .agg(
-        nb_activites_matching=("activite_id", "nunique"),
-        budget_moyen_activite=("budget_moyen_activite", "first"),
-        budget_total_org=("budget_total", "first"),
-        nb_activites_total_org=("nb_activites_total", "first"),
-    )
-    .reset_index()
-)
+agg_org = {
+    "nb_activites_matching": ("activite_id", "nunique"),
+    "budget_moyen_activite": ("budget_moyen_activite", "first"),
+    "budget_total_org": ("budget_total", "first"),
+    "nb_activites_total_org": ("nb_activites_total", "first"),
+}
+if "representants_id" in df_tmp.columns:
+    agg_org["representants_id"] = ("representants_id", lambda s: _join_unique(s, max_items=20))
+if "label_categorie_organisation" in df_tmp.columns:
+    agg_org["label_categorie_organisation"] = ("label_categorie_organisation", "first")
+
+org_search = df_tmp.groupby("denomination", dropna=False).agg(**agg_org).reset_index()
 
 # Forcer les colonnes numériques
 cols_num = [
@@ -360,6 +484,21 @@ cols_int = [
 for col in cols_int:
     org_search[col] = to_int64_safe(org_search[col])
 
+affiliations_par_org = build_affiliations_organisations(org_search)
+if not affiliations_par_org.empty:
+    org_search = org_search.merge(
+        affiliations_par_org[["denomination", "nb_affiliations", "denomination_affiliation"]],
+        on="denomination",
+        how="left",
+    )
+
+priority_org_cols = [
+    "denomination", "label_categorie_organisation", "representants_id",
+    "nb_activites_matching", "budget_estime_recherche",
+    "budget_moyen_activite", "budget_total_org", "nb_activites_total_org",
+    "nb_affiliations", "denomination_affiliation",
+]
+org_search = org_search[[c for c in priority_org_cols if c in org_search.columns] + [c for c in org_search.columns if c not in priority_org_cols]]
 org_search = org_search.sort_values("budget_estime_recherche", ascending=False)
 
 with st.expander(
@@ -504,6 +643,26 @@ else:
         f"Seuls les domaines les plus fréquents sont affichés (ici {TOP_DOMAINS})."
         f"Les bulles sont proportionelles aux budgets estimés."
     )
+
+# =========================
+# BENEFICIAIRES ET AFFILIATIONS
+# =========================
+
+beneficiaires_par_activite = build_beneficiaires_activites(selected_res)
+
+st.markdown("### Bénéficiaires des actions menées")
+st.caption("Unité d'observation : activité. Jointures : activite_id → action_representation_interet_id → bénéficiaire_action_menee.")
+if beneficiaires_par_activite.empty:
+    st.info("Aucun bénéficiaire rattaché aux activités sélectionnées.")
+else:
+    st.dataframe(beneficiaires_par_activite, use_container_width=True)
+
+st.markdown("### Affiliations des organisations")
+st.caption("Unité d'observation : organisation. Jointure : org_search.representants_id → 5_affiliations.representants_id.")
+if affiliations_par_org.empty:
+    st.info("Aucune affiliation trouvée pour les organisations de la recherche.")
+else:
+    st.dataframe(affiliations_par_org, use_container_width=True)
 
 # =========================
 # LOIS CORRESPONDANT A LA RECHERCHE
