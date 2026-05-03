@@ -95,7 +95,7 @@ c1, c2, c3 = st.columns(3)
 with c1:
     topn = st.slider(
         "Nombre d'activités", 
-        10, 200, 20, 10,
+        10, 100, 20, 10,
         help="Définit le nombre maximum d'activités de lobbying affichées dans les résultats."
     )
 
@@ -152,15 +152,15 @@ if submitted:
 # 3) READ: on lit toujours depuis session_state (jamais depuis une variable locale fragile)
 res = st.session_state.get("results", None)
 if not isinstance(res, pd.DataFrame) or res.empty:
-    st.info("Lance une recherche pour afficher des résultats.")
+    st.info("Lancez une recherche pour afficher des résultats.")
     st.stop()
 
 
 def hybrid_search_lois_local(
     query_text: str,
     topn_laws: int = 50,
-    k_bm25: int = 200,
-    k_vec: int = 200,
+    k_bm25: int = 50,
+    k_vec: int = 50,
     fusion_mode: str = "rrf",
     rrf_k: int = 60,
     alpha_vec: float = 0.55,
@@ -351,10 +351,10 @@ org_search[cols_round] = org_search[cols_round].round(0)
 # Conversion en entier nullable pour garder un vrai type numérique
 cols_int = [
     "nb_activites_matching",
+    "budget_estime_recherche",    
     "budget_moyen_activite",
-    "budget_total_org",
     "nb_activites_total_org",
-    "budget_estime_recherche",
+    "budget_total_org",
 ]
 
 for col in cols_int:
@@ -859,7 +859,7 @@ theme_llm = theme_llm.sort_values("budget_cumule_recherche_domaine", ascending=F
 
 
 # synthèse par LLM        
-st.markdown("### Synthèse LLM")
+st.markdown("### Synthèse des résultats")
 
 res = st.session_state.get("selected_results", None)
 if not isinstance(res, pd.DataFrame) or res.empty:
@@ -870,7 +870,7 @@ if not isinstance(res, pd.DataFrame) or res.empty:
     st.warning("Aucun résultat. Lancez d'abord une recherche.")
     st.stop()
 
-if st.button("Générer la synthèse", type="primary"):
+if st.button("Générer la synthèse (par LLM)", type="primary"):
     activites_llm = res[
         [c for c in ["denomination", "domaines", "objet_activite"] if c in res.columns]
     ].copy()
