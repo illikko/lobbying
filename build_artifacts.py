@@ -121,6 +121,69 @@ def _normalise_auxiliary_tables(
 
     return aff, benef, obs
 
+def _build_beneficiaires_activites_globales(
+    df_acts_min: pd.DataFrame,
+    df_observations: pd.DataFrame,
+    df_beneficiaires: pd.DataFrame,
+    df_exercices: pd.DataFrame,
+    df_objets: pd.DataFrame,
+) -> pd.DataFrame:
+    # --- NORMALISATION
+    obs = df_observations.copy()
+    benef = df_beneficiaires.copy()
+    ex = df_exercices.copy()
+    obj = df_objets.copy()
+
+    obs["activite_id"] = _norm_id_series(obs["activite_id"])
+    obs["action_representation_interet_id"] = _norm_id_series(obs["action_representation_interet_id"])
+
+    benef["action_representation_interet_id"] = _norm_id_series(benef["action_representation_interet_id"])
+    benef["beneficiaire_action_menee"] = benef["beneficiaire_action_menee"].astype("string").str.strip()
+
+    ex["exercices_id"] = _norm_id_series(ex["exercices_id"])
+    obj["exercices_id"] = _norm_id_series(obj["exercices_id"])
+    obj["activite_id"] = _norm_id_series(obj["activite_id"])
+
+    # --- BUDGET EXERCICE
+    if {"montant_depense_inf", "montant_depense_sup"}.issubset(ex.columns):
+        ex["_budget"] = (
+            pd.to_numeric(ex["montant_depense_inf"], errors="coerce").fillna(0)
+            + pd.to_numeric(ex["montant_depense_sup"], errors="coerce").fillna(0)
+        ) / 2
+    else:
+        ex["_budget"] = pd.to_numeric(ex.get("montant_depense", 0), errors="coerce").fillna(0)
+
+    # --- NB ACTIVITES REEL PAR EXERCICE
+    nb_act = (
+        obj.groupby("exercices_id")["activite_id"]
+        .nunique()
+        .rename("nb_activites_exercice")
+        .reset_index()
+    )
+
+    ex = ex.merge(nb_act, on="exercices_id", how="left")
+
+    ex["budget_activite"] = ex["_budget"] / ex["nb_activites_exercice"].replace(0, np.nan)
+    ex["budget_activite"] = ex["budget_activite"].replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    # --- BUDGET PAR ACTIVITE
+    budget_by_activity = (
+        obj.merge(ex[["exercices_id", "budget_activite"]], on="exercices_id", how="left")
+        .groupby("activite_id")["budget_activite"]
+        .sum()
+        .reset_index()
+    )
+
+    # --- MAPPING BENEFICIAIRE
+    mapping = (
+        obs.merge(benef, on="action_representation_interet_id", how="inner")
+        .rename(columns={"beneficiaire_action_menee": "beneficiaire"})
+    )
+
+    mapping = mapping[["activite_id", "beneficiaire"]].drop_duplicates()
+
+    # --- FINAL
+    return mapping.merge(budget_by_activity, on="activite_id", how="left")
 
 def build_all(cfg: BuildConfig) -> None:
     # 1) Prepare coeur historique: activités, lois, BM25, FAISS.
@@ -134,6 +197,8 @@ def build_all(cfg: BuildConfig) -> None:
     )
 
     # 2) Nouvelles tables brutes HATVP, même snapshot que les autres fichiers.
+    df_exercices_raw = _read_raw_xlsx("15_exercices.xlsx")
+    df_objets_raw = _read_raw_xlsx("8_objets_activites.xlsx")
     df_infos = _read_raw_xlsx("1_informations_generales.xlsx")
     df_affiliations_raw = _read_raw_xlsx("5_affiliations.xlsx")
     df_beneficiaires_raw = _read_raw_xlsx("11_beneficiaires.xlsx")
@@ -245,8 +310,19 @@ def build_all(cfg: BuildConfig) -> None:
             "df_affiliations": "df_affiliations.parquet",
             "df_beneficiaires": "df_beneficiaires.parquet",
             "df_observations": "df_observations.parquet",
+            "df_beneficiaires_activites_globales": "df_beneficiaires_activites_globales.parquet",
         },
     }
+    
+    df_benef_global = _build_beneficiaires_activites_globales(
+        df_acts_min=df_acts_min,
+        df_observations=df_observations,
+        df_beneficiaires=df_beneficiaires,
+        df_exercices=df_exercices_raw,
+        df_objets=df_objets_raw,
+        )
+
+    save_parquet(df_benef_global, "df_beneficiaires_activites_globales.parquet")
     write_manifest(manifest)
 
 
