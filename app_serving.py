@@ -417,7 +417,7 @@ for c in ["budget_total", "budget_moyen_activite"]:
 st.markdown("### Activités de lobbying correspondant à la recherche")
 st.markdown("Tous les budgets sont exprimés en €")
 st.markdown("Désélectionnez les activités que vous considérez non pertinentes pour votre recherche, puis validez")
-st.caption("Une organisation peut exercer une activité de lobbying directement ou via une autre organisation (société de conseil/client, groupe/filiale,...). Si l'activité exercée est directement, la HATVP utilise le terme "denomination", sinon "beneficiaire". Nous présentpons en priorité les bénéficiaires")
+st.caption("Une organisation peut exercer une activité de lobbying directement ou via une autre organisation (société de conseil/client, groupe/filiale,...).")
 
 # formatage des dates
 if "date_publication_activite" in show.columns:
