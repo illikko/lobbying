@@ -42,7 +42,7 @@ with st.expander("ℹ️ À propos de l'application", expanded=False):
         """)
 
 with st.expander("ℹ️ Comment ça marche ?", expanded=False):
-        st.mardown("""
+        st.markdown("""
         • écrire les mots clés recherchés ou les phrases dans le formulaire "mots-clés / requête", puis cliquer sur "Lancer" pour obtenir les résultats de recherche  
         • lire les résultats (objet_activite), et dé-sélectionner les activités qui ne sont pas pertinentes (colonne "Sélection"), puis cliquer sur "Valider la sélection" pour confirmer les activités retenues  
         • faire de même pour les lois correspondant à la recherche (dé-sélectionner les lois non pertinentes, puis valider)  
