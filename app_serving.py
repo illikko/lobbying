@@ -13,10 +13,14 @@ import plotly.graph_objects as go
 import plotly.express as px
 from rank_bm25 import BM25Okapi
 from src.textnorm import tokenize
+
+
+# --- Query embedding with sentence-transformers is NOT used on Render.
+# We must embed the query using the same model space as offline embeddings.
+# Simplest: also ship sentence-transformers on Render and encode just the query (light).
+# If you want to avoid torch on Render, you'd need an external embedding service.
 from sentence_transformers import SentenceTransformer
 
-
-# application Streamlit
 st.set_page_config(page_title="Cartographie des influences", layout="wide")
 st.title("Cartographie des influences")
 
@@ -25,14 +29,14 @@ if "results" not in st.session_state:
 
 with st.expander("ℹ️ À propos de l'application", expanded=False):
         st.write("""
-        Cette application permet de cartographier les activités de lobbying en France.  
-        Elle utilise une recherche hybride lexicale et sémantique pour trouver les activités les plus pertinentes par rapport à une requête comprenant plusieurs mots clé ou une/plusieurs phrases.  
-        &nbsp;&nbsp;&nbsp;&nbsp; par exemple: transport, fret, fiscalité  
-        Les résultats de la recherche sont présentés sous forme de:  
-        • tableau avec des filtres interactifs  
-        • matrice à bulles représentant les organisations et les domaines d'activité  
-        • frise chronoligique des activités de lobbying et des lois  
-        • synthèse par IA des activités de lobbying  
+        Cette application permet de cartographier les activités de lobbying en France.
+        Elle utilise une recherche hybride lexical et sémantique pour trouver les activités les plus pertinentes par rapport à une requête comprenant plusieurs mots clé.
+            ex.: transport, fret, fiscalité
+        Les résultats de la recherche sont présentés sous forme de 
+        - tableau avec des filtres interactifs
+        - une matrice à bulles représentant les organisations et les domaines d'activité, 
+        - une frise chronoligique des activités de lobbying et des lois
+        - une synthèse par IA des activités de lobbying.
         
         Elle utilise les données ouvertes de la HATPV sur les activités de lobbying (environ 100K activités) et les lois du Sénat (envrion 6000 lois).
         L'application est à un stade d'expérimentation, et évolue en fonction des retours de ses utilisateurs.
@@ -41,12 +45,12 @@ with st.expander("ℹ️ À propos de l'application", expanded=False):
 
 with st.expander("ℹ️ Comment ça marche ?", expanded=False):
         st.write("""
-        • écrire les mots clés recherchés ou les phrases dans le formulaire "mots-clés / requête", puis cliquer sur "Lancer" pour obtenir les résultats de recherche  
-        • lire les résultats (objet_activite), et dé-sélectionner les activités qui ne sont pas pertinentes (colonne "Sélection"), puis cliquer sur "Valider la sélection" pour confirmer les activités retenues  
-        • faire de même pour les lois correspondant à la recherche (dé-sélectionner les lois non pertinentes, puis valider)  
-        • explorer les différentes visualisations (matrice à bulles, frise chronologique)  
-        • dans l'onglet "Synthèse", cliquer sur "Générer la synthèse" pour obtenir une synthèse textuelle des activités de lobbying retenues, par un modèle de langage (LLM)  
-        • utiliser les filtres pour ajuster la recherche: nombre de résultats demandés, budget, période  
+        - écrire les mots clés recherchés dans le formulaire "mots-clés / requête", puis cliquer sur "Lancer" pour obtenir les résultats de recherche
+        - lire les résultats (objet_activite), et dé-sélectionner les activités qui ne sont pas pertinentes (colonne "Sélection"), puis cliquer sur "Valider la sélection" pour confirmer les activités retenues
+        - faire de même pour les lois correspondant à la recherche (dé-sélectionner les lois non pertinentes, puis valider)
+        - explorer les différentes visualisations (matrice à bulles, frise chronologique)
+        - dans l'onglet "Synthèse", cliquer sur "Générer la synthèse" pour obtenir une synthèse textuelle des activités de lobbying retenues, par un modèle de langage (LLM).
+        - utiliser les filtres pour ajuster la recherche: nombre de résultats demandés, budget, période.
         """)
 
 @st.cache_resource(show_spinner="Chargement artefacts…")
@@ -61,9 +65,6 @@ def load_all():
     bm25_lois_bundle = load_joblib(ART.bm25_lois)
     faiss_lois_index = load_faiss(ART.faiss_lois)
     id_map_lois = load_parquet(ART.id_map_lois)
-    df_affiliations = load_parquet("df_affiliations.parquet")
-    df_beneficiaires = load_parquet("df_beneficiaires.parquet")
-    df_observations = load_parquet("df_observations.parquet")
 
     # rebuild FaissBundle doc_ids in index order
     doc_ids = id_map["activite_id"].astype(object).to_numpy()
@@ -75,133 +76,14 @@ def load_all():
     st_model = (manifest.get("config", {}) or {}).get("st_model", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
     embedder = SentenceTransformer(st_model)
 
-    return (
-        manifest, df_acts, df_lois, docs, bm25_bundle, faiss_bundle,
-        bm25_lois_bundle, faiss_lois_bundle, embedder,
-        df_affiliations, df_beneficiaires, df_observations,
-    )
+    return manifest, df_acts, df_lois, docs, bm25_bundle, faiss_bundle, bm25_lois_bundle, faiss_lois_bundle, embedder
 
-(
-    manifest, df_acts, df_lois, docs, bm25_bundle, faiss_bundle,
-    bm25_lois_bundle, faiss_lois_bundle, embedder,
-    df_affiliations, df_beneficiaires, df_observations,
-) = load_all()
+manifest, df_acts, df_lois, docs, bm25_bundle, faiss_bundle, bm25_lois_bundle, faiss_lois_bundle, embedder = load_all()
 
 def embed_query_fn(q: str) -> np.ndarray:
     q = "" if q is None else str(q)
     v = embedder.encode([q], convert_to_numpy=True)[0]
     return v.astype("float32", copy=False)
-
-
-def _norm_id_series(s: pd.Series) -> pd.Series:
-    return (
-        s.astype("string")
-        .str.strip()
-        .str.replace(r"\.0$", "", regex=True)
-        .mask(lambda x: x.str.lower().isin(["", "nan", "none", "<na>"]))
-    )
-
-
-def _explode_ids(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    if df is None or df.empty or col not in df.columns:
-        return pd.DataFrame(columns=[] if df is None else list(df.columns))
-    out = df.copy()
-    out[col] = _norm_id_series(out[col])
-    out[col] = out[col].str.split(r"\s*[;,|]\s*", regex=True)
-    out = out.explode(col)
-    out[col] = _norm_id_series(out[col])
-    return out.dropna(subset=[col])
-
-
-def _join_unique(values, max_items: int = 80) -> str:
-    out = []
-    seen = set()
-    for value in pd.Series(values).dropna().astype(str):
-        value = value.strip()
-        if not value or value.lower() in {"nan", "none", "<na>"}:
-            continue
-        if value not in seen:
-            seen.add(value)
-            out.append(value)
-        if len(out) >= max_items:
-            break
-    if len(seen) > max_items:
-        out.append(f"… (+{len(seen) - max_items} autres)")
-    return "; ".join(out)
-
-
-def build_affiliations_organisations(org_search: pd.DataFrame) -> pd.DataFrame:
-    """Affiliations au niveau organisation: org_search.representants_id -> 5_affiliations."""
-    if org_search is None or org_search.empty:
-        return pd.DataFrame()
-    if "representants_id" not in org_search.columns:
-        return pd.DataFrame()
-    required = {"representants_id", "denomination_affiliation"}
-    if df_affiliations.empty or not required.issubset(df_affiliations.columns):
-        return pd.DataFrame()
-
-    org_ids = _explode_ids(org_search[["denomination", "representants_id"]].drop_duplicates(), "representants_id")
-    aff = df_affiliations[["representants_id", "denomination_affiliation"]].copy()
-    aff = _explode_ids(aff, "representants_id")
-    aff["denomination_affiliation"] = aff["denomination_affiliation"].astype("string").str.strip()
-    aff = aff.dropna(subset=["representants_id", "denomination_affiliation"]).drop_duplicates()
-
-    detail = org_ids.merge(aff, on="representants_id", how="inner")
-    if detail.empty:
-        return pd.DataFrame()
-
-    return (
-        detail.groupby("denomination", dropna=False)
-        .agg(
-            nb_affiliations=("denomination_affiliation", "nunique"),
-            denomination_affiliation=("denomination_affiliation", lambda s: _join_unique(s, max_items=120)),
-        )
-        .reset_index()
-        .sort_values(["nb_affiliations", "denomination"], ascending=[False, True])
-    )
-
-
-def build_beneficiaires_activites(selected_res: pd.DataFrame) -> pd.DataFrame:
-    """Bénéficiaires au niveau activité: activite_id -> observations -> beneficiaires."""
-    if selected_res is None or selected_res.empty:
-        return pd.DataFrame()
-    required_obs = {"activite_id", "action_representation_interet_id"}
-    required_ben = {"action_representation_interet_id", "beneficiaire_action_menee"}
-    if df_observations.empty or df_beneficiaires.empty:
-        return pd.DataFrame()
-    if not required_obs.issubset(df_observations.columns) or not required_ben.issubset(df_beneficiaires.columns):
-        return pd.DataFrame()
-
-    acts = selected_res.copy()
-    if "activite_id" not in acts.columns:
-        acts = acts.reset_index().rename(columns={"index": "activite_id"})
-    acts["activite_id"] = _norm_id_series(acts["activite_id"])
-
-    obs = df_observations[["activite_id", "action_representation_interet_id"]].copy()
-    obs["activite_id"] = _norm_id_series(obs["activite_id"])
-    obs["action_representation_interet_id"] = _norm_id_series(obs["action_representation_interet_id"])
-    obs = obs[obs["activite_id"].isin(set(acts["activite_id"].dropna()))].drop_duplicates()
-
-    benef = df_beneficiaires[["action_representation_interet_id", "beneficiaire_action_menee"]].copy()
-    benef["action_representation_interet_id"] = _norm_id_series(benef["action_representation_interet_id"])
-    benef["beneficiaire_action_menee"] = benef["beneficiaire_action_menee"].astype("string").str.strip()
-
-    detail = (
-        obs.merge(benef, on="action_representation_interet_id", how="inner")
-           .merge(acts[["activite_id", "denomination", "objet_activite"]].drop_duplicates(), on="activite_id", how="left")
-    )
-    if detail.empty:
-        return pd.DataFrame()
-
-    return (
-        detail.groupby(["denomination", "objet_activite"], dropna=False)
-        .agg(
-            nb_beneficiaires=("beneficiaire_action_menee", "nunique"),
-            beneficiaire_action_menee=("beneficiaire_action_menee", lambda s: _join_unique(s, max_items=80)),
-        )
-        .reset_index()
-        .sort_values(["nb_beneficiaires", "denomination"], ascending=[False, True])
-    )
 
 # --- UI
 st.markdown("### Recherche des activités de lobbying")
@@ -215,25 +97,11 @@ query = st.text_input("Mots-clés / requête", value="")
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    topn = st.slider(
-        "Nombre d'activités", 
-        10, 100, 20, 10,
-        help="Définit le nombre maximum d'activités de lobbying affichées dans les résultats."
-    )
-
+    topn = st.slider("Top N", 10, 200, 20, 10)
 with c2:
-    min_budget = st.slider(
-        "Budget moyen/activité minimum (€)", 
-        0, 5000, 0, 100,
-        help="Filtre les activités de lobbying dont le budget moyen par activité (pour chaque organisation) est supérieur ou égal à ce montant. Cela permet de se concentrer sur les activités potentiellement plus significatives en termes d'influence."
-    )
-
+    min_budget = st.slider("Budget moyen/activité min (€)", 0, 5000, 0, 100)
 with c3:
-    year_range = st.slider(
-        "Période (année)", 
-        y_min, y_max, (y_min, y_max),
-        help="Filtre les activités de lobbying publiées dans cette plage d'années. Cela permet de se concentrer sur les activités récentes ou sur une période spécifique d'intérêt."
-    )
+    year_range = st.slider("Période (année)", y_min, y_max, (y_min, y_max))
 
 min_bm25 = 8.0
 min_vec  = 0.5
@@ -274,15 +142,15 @@ if submitted:
 # 3) READ: on lit toujours depuis session_state (jamais depuis une variable locale fragile)
 res = st.session_state.get("results", None)
 if not isinstance(res, pd.DataFrame) or res.empty:
-    st.info("Lancez une recherche pour afficher des résultats.")
+    st.info("Lance une recherche pour afficher des résultats.")
     st.stop()
 
 
 def hybrid_search_lois_local(
     query_text: str,
     topn_laws: int = 50,
-    k_bm25: int = 50,
-    k_vec: int = 50,
+    k_bm25: int = 200,
+    k_vec: int = 200,
     fusion_mode: str = "rrf",
     rrf_k: int = 60,
     alpha_vec: float = 0.55,
@@ -343,15 +211,6 @@ def hybrid_search_lois_local(
     cand = cand.sort_values("hybrid_score", ascending=False).head(int(topn_laws))
     return cand
 
-def to_int64_safe(series: pd.Series) -> pd.Series:
-    """Convertit en Int64 en neutralisant les infinis."""
-    return (
-        pd.to_numeric(series, errors="coerce")
-        .replace([np.inf, -np.inf], np.nan)
-        .round(0)
-        .astype("Int64")
-    )
-
 res = st.session_state.get("results", None)
 
 if not isinstance(res, pd.DataFrame) or res.empty:
@@ -371,34 +230,17 @@ rest = [c for c in show.columns if c not in priority]
 show = show.loc[:, [c for c in priority if c in show.columns] + rest]
 for c in ["budget_total", "budget_moyen_activite"]:
     if c in show.columns:
-        show[c] = (
-            pd.to_numeric(show[c], errors="coerce")
-            .replace([np.inf, -np.inf], np.nan)  # ← neutralise les infinis
-            .round(0)
-            .astype("Int64")
-        )
+        show[c] = pd.to_numeric(show[c], errors="coerce").round(0).astype("Int64")
 
 
 
 st.markdown("### Résultats des activités de lobbying")
 st.markdown("Désélectionnez ce qui n'est pas pertinent, puis validez")
-
-# formatage des dates
-if "date_publication_activite" in show.columns:
-    show["date_publication_activite"] = pd.to_datetime(
-        show["date_publication_activite"], errors="coerce"
-    )
     
 edited = st.data_editor(
     show,
     use_container_width=True,
-    column_config={
-        "selected": st.column_config.CheckboxColumn("Sélection", default=True),
-        "date_publication_activite": st.column_config.DatetimeColumn(
-            "Date",
-            format="YYYY-MM-DD"
-        ),
-    },
+    column_config={"selected": st.column_config.CheckboxColumn("Sélection", default=True)},
     disabled=[c for c in show.columns if c != "selected"],
     key="results_editor",
 )
@@ -407,7 +249,7 @@ colv1, colv2 = st.columns([1, 4])
 with colv1:
     validate = st.button("✅ Valider la sélection", type="primary")
 with colv2:
-    st.caption("La matrice, la frise chronologique et la synthèse des activités seront produites uniquement avec les lignes sélectionnées.")
+    st.caption("La matrice et les lois correspondantes seront calculées uniquement sur les lignes sélectionnées.")
 
 if validate:
     st.session_state.selected_results = (
@@ -425,7 +267,7 @@ if not isinstance(selected_res, pd.DataFrame) or selected_res.empty:
 # =========================
 # BUDGET ESTIMÉ SUR LA RECHERCHE (org) - SUR selected_res
 # =========================
-st.markdown("#### Analyse du budget par organisation")
+st.markdown("#### Budget estimé sur la recherche (par organisation)")
 
 df_tmp = selected_res.copy()
 if "activite_id" not in df_tmp.columns:
@@ -433,78 +275,23 @@ if "activite_id" not in df_tmp.columns:
 if "activite_id" not in df_tmp.columns:
     df_tmp["activite_id"] = df_tmp.index.astype(str)
 
-agg_org = {
-    "nb_activites_matching": ("activite_id", "nunique"),
-    "budget_moyen_activite": ("budget_moyen_activite", "first"),
-    "budget_total_org": ("budget_total", "first"),
-    "nb_activites_total_org": ("nb_activites_total", "first"),
-}
-if "representants_id" in df_tmp.columns:
-    agg_org["representants_id"] = ("representants_id", lambda s: _join_unique(s, max_items=20))
-if "label_categorie_organisation" in df_tmp.columns:
-    agg_org["label_categorie_organisation"] = ("label_categorie_organisation", "first")
-
-org_search = df_tmp.groupby("denomination", dropna=False).agg(**agg_org).reset_index()
-
-# Forcer les colonnes numériques
-cols_num = [
-    "nb_activites_matching",
-    "budget_moyen_activite",
-    "budget_total_org",
-    "nb_activites_total_org",
-]
-
-for col in cols_num:
-    org_search[col] = pd.to_numeric(org_search[col], errors="coerce")
-
-# Calcul
-org_search["budget_estime_recherche"] = (
-    org_search["budget_moyen_activite"].fillna(0)
-    * org_search["nb_activites_matching"].fillna(0)
-)
-
-# Arrondi à l'entier
-cols_round = [
-    "budget_moyen_activite",
-    "budget_total_org",
-    "budget_estime_recherche",
-]
-
-org_search[cols_round] = org_search[cols_round].round(0)
-
-# Conversion en entier nullable pour garder un vrai type numérique
-cols_int = [
-    "nb_activites_matching",
-    "budget_estime_recherche",    
-    "budget_moyen_activite",
-    "nb_activites_total_org",
-    "budget_total_org",
-]
-
-for col in cols_int:
-    org_search[col] = to_int64_safe(org_search[col])
-
-affiliations_par_org = build_affiliations_organisations(org_search)
-if not affiliations_par_org.empty:
-    org_search = org_search.merge(
-        affiliations_par_org[["denomination", "nb_affiliations", "denomination_affiliation"]],
-        on="denomination",
-        how="left",
+org_search = (
+    df_tmp.groupby("denomination", dropna=False)
+    .agg(
+        nb_activites_matching=("activite_id", "nunique"),
+        budget_moyen_activite=("budget_moyen_activite", "first"),
+        budget_total_org=("budget_total", "first"),
+        nb_activites_total_org=("nb_activites_total", "first"),
     )
-
-priority_org_cols = [
-    "denomination", "label_categorie_organisation", "representants_id",
-    "nb_activites_matching", "budget_estime_recherche",
-    "budget_moyen_activite", "budget_total_org", "nb_activites_total_org",
-    "nb_affiliations", "denomination_affiliation",
-]
-org_search = org_search[[c for c in priority_org_cols if c in org_search.columns] + [c for c in org_search.columns if c not in priority_org_cols]]
+    .reset_index()
+)
+org_search["budget_estime_recherche"] = (
+    pd.to_numeric(org_search["budget_moyen_activite"], errors="coerce").fillna(0.0)
+    * pd.to_numeric(org_search["nb_activites_matching"], errors="coerce").fillna(0.0)
+)
 org_search = org_search.sort_values("budget_estime_recherche", ascending=False)
 
-with st.expander(
-    "Pour chaque organisation: nombre d'activités et budget correspondant à la recherche, et budget global et moyen par activité",
-    expanded=False,
-):
+with st.expander("Détail budget estimé (budget_moyen_activite × nb_activites_matching)", expanded=False):
     st.dataframe(org_search, use_container_width=True)
 
 # =========================
@@ -513,7 +300,7 @@ with st.expander(
 st.markdown("### Matrice organisations × domaines")
 
 MIN_BUDGET = float(min_budget)
-TOP_DOMAINS = 12  
+TOP_DOMAINS = 12  # tu peux en faire un slider
 
 df2 = selected_res.copy()
 if "activite_id" not in df2.columns:
@@ -594,8 +381,8 @@ else:
     cell["hover"] = (
         "<b>Organisation :</b> " + cell["denomination"].astype(str) +
         "<br><b>Domaine :</b> " + cell["domaines_list"].astype(str) +
-        "<br><b>Budget estimé sur la recherche (réparti) :</b> " + cell["budget_total"].fillna(0).replace([np.inf, -np.inf], 0).round(0).astype(int).astype(str) +
-        "<br><b>Nb activités matching :</b> " + cell["nb_activites"].fillna(0).replace([np.inf, -np.inf], 0).astype(int).astype(str) +
+        "<br><b>Budget estimé sur la recherche (réparti) :</b> " + cell["budget_total"].round(0).astype(int).astype(str) +
+        "<br><b>Nb activités matching :</b> " + cell["nb_activites"].astype(int).astype(str) +
         "<br><b>Score hybride moyen :</b> " + cell["hybrid_moy"].fillna(0).round(3).astype(str) +
         "<br><b>Objets :</b> " + cell["objets"].astype(str)
     )
@@ -625,7 +412,7 @@ else:
     left_margin = min(520, max(180, 7 * max_len_org))
 
     figm.update_layout(
-        title=f"Répartition du budget de lobbying par organisation et domaine.",
+        title=f"Matrice org × domaines (bulles ∝ budget estimé réparti) — filtre ≥ {MIN_BUDGET:.0f} €, top {TOP_DOMAINS} domaines",
         xaxis=dict(title="Domaines", categoryorder="array", categoryarray=dom_order, tickangle=45),
         yaxis=dict(title="Organisations", categoryorder="array", categoryarray=org_order, autorange="reversed"),
         height=max(650, 28 * len(org_order) + 240),
@@ -636,33 +423,6 @@ else:
     figm.update_xaxes(showgrid=True)
 
     st.plotly_chart(figm, use_container_width=True)
-    
-    st.caption(
-        f"Le budget par organisation et domaine est estimé à partir du budget moyen par activité, "
-        f"réparti entre les domaines d'activité de chaque activité. "
-        f"Seuls les domaines les plus fréquents sont affichés (ici {TOP_DOMAINS})."
-        f"Les bulles sont proportionelles aux budgets estimés."
-    )
-
-# =========================
-# BENEFICIAIRES ET AFFILIATIONS
-# =========================
-
-beneficiaires_par_activite = build_beneficiaires_activites(selected_res)
-
-st.markdown("### Bénéficiaires des actions menées")
-st.caption("Unité d'observation : activité. Jointures : activite_id → action_representation_interet_id → bénéficiaire_action_menee.")
-if beneficiaires_par_activite.empty:
-    st.info("Aucun bénéficiaire rattaché aux activités sélectionnées.")
-else:
-    st.dataframe(beneficiaires_par_activite, use_container_width=True)
-
-st.markdown("### Affiliations des organisations")
-st.caption("Unité d'observation : organisation. Jointure : org_search.representants_id → 5_affiliations.representants_id.")
-if affiliations_par_org.empty:
-    st.info("Aucune affiliation trouvée pour les organisations de la recherche.")
-else:
-    st.dataframe(affiliations_par_org, use_container_width=True)
 
 # =========================
 # LOIS CORRESPONDANT A LA RECHERCHE
@@ -689,14 +449,9 @@ def search_lois(qtxt: str, top_n: int = 50):
     out["bm25_score"] = scores[idx]
     return out.sort_values("bm25_score", ascending=False)
 
-with st.expander("Paramètres pour la recherche sur les lois", expanded=False):
-    topn_laws = st.slider(
-        "Nombre de lois", 
-        5, 200, 20, 5,
-        help="Nombre maximum de lois affichées correspondant à la recherche."
-    )
-    
-    apply_year_filter_laws = st.checkbox("Appliquer aux lois le filtre de la période déjà sélectionné pour les activités de lobbying", value=True)
+with st.expander("Paramètres Lois", expanded=False):
+    topn_laws = st.slider("Top N lois", 5, 200, 20, 5)
+    apply_year_filter_laws = st.checkbox("Appliquer filtre période aux lois", value=True)
     
     k_bm25_laws =  200
     k_vec_laws = 200
@@ -728,22 +483,10 @@ if "selected" not in show_laws.columns:
 
 st.markdown("#### Lois correspondant à la recherche")
 st.markdown("Désélectionnez les lois non pertinentes, puis validez")
-
-if "date_publication_activite" in show.columns:
-    show["date_publication_activite"] = pd.to_datetime(
-        show["date_publication_activite"], errors="coerce"
-    )
-
 edited_laws = st.data_editor(
     show_laws,
     use_container_width=True,
-    column_config={
-        "selected": st.column_config.CheckboxColumn("Sélection", default=True),
-        "date_publication_activite": st.column_config.DatetimeColumn(
-            "Date",
-            format="YYYY-MM-DD"
-        ),
-    },
+    column_config={"selected": st.column_config.CheckboxColumn("Sélection", default=True)},
     disabled=[c for c in show_laws.columns if c != "selected"],
     key="laws_editor",
 )
@@ -878,147 +621,8 @@ figt.update_layout(
 
 st.plotly_chart(figt, use_container_width=True)
 
-
-# =========================
-# PREPARATION DONNEES LLM
-# =========================
-
-df_llm = selected_res.copy()
-
-if "activite_id" not in df_llm.columns:
-    df_llm = df_llm.reset_index().rename(columns={"index": "activite_id"})
-if "activite_id" not in df_llm.columns:
-    df_llm["activite_id"] = df_llm.index.astype(str)
-
-# Colonnes numériques utiles
-for col in ["budget_moyen_activite", "budget_total", "nb_activites_total", "hybrid_score"]:
-    if col in df_llm.columns:
-        df_llm[col] = pd.to_numeric(df_llm[col], errors="coerce")
-
-# Domaines : on garde "Non renseigné" pour ne pas perdre de budget
-df_llm["domaines"] = df_llm.get("domaines", "").fillna("").astype(str)
-df_llm["domaines_list"] = df_llm["domaines"].apply(
-    lambda s: [d.strip() for d in s.split(";") if d.strip()] if s.strip() else ["Non renseigné"]
-)
-
-df_llm["nb_domaines"] = df_llm["domaines_list"].apply(lambda x: max(len(x), 1))
-
-# Budget réparti entre les domaines de l'activité
-df_llm["budget_reparti"] = (
-    df_llm["budget_moyen_activite"].fillna(0.0) / df_llm["nb_domaines"]
-)
-
-df_llm_exploded = df_llm.explode("domaines_list").rename(columns={"domaines_list": "domaine"})
-df_llm_exploded["domaine"] = df_llm_exploded["domaine"].fillna("Non renseigné").astype(str)
-
-# ---------- Tableau 1 : organisation (budget recherche + poids global)
-org_llm = (
-    df_llm_exploded.groupby("denomination", dropna=False)
-    .agg(
-        budget_cumule_recherche=("budget_reparti", "sum"),
-        nb_activites_matching=("activite_id", "nunique"),
-        budget_total_lobbying=("budget_total", "max"),
-        nb_activites_total_org=("nb_activites_total", "max"),
-    )
-    .reset_index()
-)
-
-budget_total_recherche = float(org_llm["budget_cumule_recherche"].sum()) if not org_llm.empty else 0.0
-
-org_llm["part_budget_recherche_pct"] = np.where(
-    budget_total_recherche > 0,
-    100 * org_llm["budget_cumule_recherche"] / budget_total_recherche,
-    0.0
-)
-
-# Arrondis
-for col in ["budget_cumule_recherche", "budget_total_lobbying"]:
-    org_llm[col] = to_int64_safe(org_llm[col])
-
-for col in ["nb_activites_matching", "nb_activites_total_org"]:
-    org_llm[col] = pd.to_numeric(org_llm[col], errors="coerce").round(0).astype("Int64")
-
-org_llm["part_budget_recherche_pct"] = org_llm["part_budget_recherche_pct"].round(1)
-
-org_llm = org_llm.sort_values("budget_cumule_recherche", ascending=False)
-
-# ---------- Tableau 2 : organisation x domaine
-org_theme_llm = (
-    df_llm_exploded.groupby(["denomination", "domaine"], dropna=False)
-    .agg(
-        budget_cumule_recherche_org_domaine=("budget_reparti", "sum"),
-        nb_activites_matching_org_domaine=("activite_id", "nunique"),
-        objets_activite=("objet_activite", lambda s: list(pd.Series(s).dropna().astype(str).unique())[:12]),
-    )
-    .reset_index()
-)
-
-# rattacher le budget recherche total de l'organisation
-org_theme_llm = org_theme_llm.merge(
-    org_llm[["denomination", "budget_cumule_recherche"]],
-    on="denomination",
-    how="left"
-)
-
-_denom = pd.to_numeric(org_theme_llm["budget_cumule_recherche"], errors="coerce").fillna(0)
-org_theme_llm["part_du_budget_recherche_org_pct"] = np.where(
-    _denom > 0,
-    100 * pd.to_numeric(org_theme_llm["budget_cumule_recherche_org_domaine"], errors="coerce").fillna(0) / _denom,
-    0.0
-)
-
-org_theme_llm["part_du_budget_total_recherche_pct"] = np.where(
-    budget_total_recherche > 0,
-    100 * org_theme_llm["budget_cumule_recherche_org_domaine"] / budget_total_recherche,
-    0.0
-)
-
-org_theme_llm["budget_cumule_recherche_org_domaine"] = to_int64_safe(
-    org_theme_llm["budget_cumule_recherche_org_domaine"]
-)
-
-org_theme_llm["nb_activites_matching_org_domaine"] = to_int64_safe(
-    org_theme_llm["nb_activites_matching_org_domaine"]
-)
-
-org_theme_llm["part_du_budget_recherche_org_pct"] = org_theme_llm["part_du_budget_recherche_org_pct"].round(1)
-org_theme_llm["part_du_budget_total_recherche_pct"] = org_theme_llm["part_du_budget_total_recherche_pct"].round(1)
-
-org_theme_llm = org_theme_llm.sort_values(
-    ["budget_cumule_recherche_org_domaine", "nb_activites_matching_org_domaine"],
-    ascending=False
-)
-
-# ---------- Tableau 3 : domaine
-theme_llm = (
-    org_theme_llm.groupby("domaine", dropna=False)
-    .agg(
-        budget_cumule_recherche_domaine=("budget_cumule_recherche_org_domaine", "sum"),
-        nb_organisations=("denomination", "nunique"),
-        nb_activites_matching=("nb_activites_matching_org_domaine", "sum"),
-    )
-    .reset_index()
-)
-
-theme_llm["part_budget_recherche_pct"] = np.where(
-    budget_total_recherche > 0,
-    100 * pd.to_numeric(theme_llm["budget_cumule_recherche_domaine"], errors="coerce") / budget_total_recherche,
-    0.0
-)
-
-theme_llm["budget_cumule_recherche_domaine"] = to_int64_safe(
-    theme_llm["budget_cumule_recherche_domaine"]
-)
-
-theme_llm["part_budget_recherche_pct"] = theme_llm["part_budget_recherche_pct"].round(1)
-theme_llm["nb_organisations"] = to_int64_safe(theme_llm["nb_organisations"])
-theme_llm["nb_activites_matching"] = to_int64_safe(theme_llm["nb_activites_matching"])
-
-theme_llm = theme_llm.sort_values("budget_cumule_recherche_domaine", ascending=False)
-
-
 # synthèse par LLM        
-st.markdown("### Synthèse des résultats")
+st.markdown("### Synthèse LLM")
 
 res = st.session_state.get("selected_results", None)
 if not isinstance(res, pd.DataFrame) or res.empty:
@@ -1026,29 +630,13 @@ if not isinstance(res, pd.DataFrame) or res.empty:
     res = st.session_state.get("results", None)
     
 if not isinstance(res, pd.DataFrame) or res.empty:
-    st.warning("Aucun résultat. Lancez d'abord une recherche.")
+    st.warning("Aucun résultat. Lance d'abord une recherche.")
     st.stop()
 
-if st.button("Générer la synthèse (par LLM)", type="primary"):
-    activites_llm = res[
-        [c for c in ["denomination", "domaines", "objet_activite"] if c in res.columns]
-    ].copy()
-
-    info_llm = {
-        "contexte": {
-            "requete": st.session_state.get("last_query", ""),
-            "nb_activites_retenues": int(res["activite_id"].nunique()) if "activite_id" in res.columns else int(len(res)),
-            "budget_total_estime_recherche": round(budget_total_recherche),
-        },
-        "tableau_organisations": org_llm.to_dict(orient="records"),
-        "tableau_organisations_domaines": org_theme_llm.to_dict(orient="records"),
-        "tableau_domaines": theme_llm.to_dict(orient="records"),
-        "activites_selectionnees": activites_llm.to_dict(orient="records"),
-    }
-
+if st.button("Générer la synthèse", type="primary"):
+    info_llm = res[[c for c in ["denomination", "budget_moyen_activite", "domaines", "objet_activite"] if c in res.columns]].to_dict(orient="records")
     with st.spinner("Synthèse…"):
         txt = summarize_activites(info_llm)
-
     st.session_state.synth = txt
 
 if st.session_state.get("synth"):

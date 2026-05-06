@@ -6,6 +6,9 @@ __pycache__/
 build/
 dist/
 
+scripts_local/
+*.bat
+
 # Environnements locaux
 .venv/
 venv/
@@ -19,18 +22,26 @@ env/
 .DS_Store
 Thumbs.db
 
-# Logs / caches
+# Logs
 *.log
+
+# Caches
 .ipynb_checkpoints/
 .cache/
 
-# Scripts locaux
-scripts_local/
-*.bat
+# Temp artifacts
+artifacts/*.tmp
+artifacts/*.json.tmp
 
-# Artefacts générés
-artifacts/
+# Raw data (ne pas versionner)
+data/raw/
+*.xlsx
+*.csv
 
-# Données brutes
-# IMPORTANT : ne pas ignorer data/raw/ si Render doit construire les artefacts.
-# data/raw/
+# Temp artifacts
+artifacts/*.tmp
+artifacts/*.json.tmp
+
+# Caches
+.ipynb_checkpoints/
+.cache/
