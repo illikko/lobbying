@@ -121,36 +121,6 @@ def _normalise_auxiliary_tables(
 
     return aff, benef, obs
 
-
-def _build_budget_by_activity(df_exercices: pd.DataFrame, df_objets: pd.DataFrame) -> pd.DataFrame:
-    """Budget estimé par activité depuis 15_exercices et 8_objets_activites."""
-    ex = df_exercices.copy()
-    obj = df_objets.copy()
-
-    ex["exercices_id"] = _norm_id_series(ex["exercices_id"])
-    obj["exercices_id"] = _norm_id_series(obj["exercices_id"])
-    obj["activite_id"] = _norm_id_series(obj["activite_id"])
-
-    if {"montant_depense_inf", "montant_depense_sup"}.issubset(ex.columns):
-        ex["_budget"] = (
-            pd.to_numeric(ex["montant_depense_inf"], errors="coerce").fillna(0)
-            + pd.to_numeric(ex["montant_depense_sup"], errors="coerce").fillna(0)
-        ) / 2
-    else:
-        ex["_budget"] = pd.to_numeric(ex.get("montant_depense", 0), errors="coerce").fillna(0)
-
-    nb_act = obj.groupby("exercices_id")["activite_id"].nunique().rename("nb_activites_exercice").reset_index()
-    ex = ex.merge(nb_act, on="exercices_id", how="left")
-    ex["budget_activite"] = ex["_budget"] / ex["nb_activites_exercice"].replace(0, np.nan)
-    ex["budget_activite"] = ex["budget_activite"].replace([np.inf, -np.inf], np.nan).fillna(0)
-
-    return (
-        obj.merge(ex[["exercices_id", "budget_activite"]], on="exercices_id", how="left")
-        .groupby("activite_id", dropna=False)["budget_activite"]
-        .sum()
-        .reset_index()
-    )
-
 def _build_beneficiaires_activites_globales(
     df_acts_min: pd.DataFrame,
     df_observations: pd.DataFrame,
@@ -216,6 +186,7 @@ def _build_beneficiaires_activites_globales(
     return mapping.merge(budget_by_activity, on="activite_id", how="left")
 
 def build_all(cfg: BuildConfig) -> None:
+    print("1/ Préparation coeur activités + lois", flush=True)
     # 1) Prepare coeur historique: activités, lois, BM25, FAISS.
     df_acts, df_lois = prepare_from_raw(
         xlsx_organisations=_raw("1_informations_generales.xlsx"),
@@ -226,6 +197,7 @@ def build_all(cfg: BuildConfig) -> None:
         csv_promulguees=_raw("promulguees.csv"),
     )
 
+    print("2/ Lecture tables auxiliaires HATVP", flush=True)
     # 2) Nouvelles tables brutes HATVP, même snapshot que les autres fichiers.
     df_exercices_raw = _read_raw_xlsx("15_exercices.xlsx")
     df_objets_raw = _read_raw_xlsx("8_objets_activites.xlsx")
@@ -240,6 +212,8 @@ def build_all(cfg: BuildConfig) -> None:
         df_observations_raw,
     )
 
+    print("3/ Normalisation tables auxiliaires terminée", flush=True)
+
     df_acts = df_acts.sort_index()
     df_acts_min = minify_activites(df_acts)
 
@@ -248,14 +222,9 @@ def build_all(cfg: BuildConfig) -> None:
         df_acts_min["representants_id"] = _norm_id_series(df_acts["representants_id"])
     df_acts_min = _add_categorie_to_activites(df_acts_min, df_infos)
 
-    # Ajout minimal: budget estimé par activité dans df_acts_min, pour que l'app
-    # utilise la même logique que l'artefact bénéficiaires.
-    budget_by_activity = _build_budget_by_activity(df_exercices_raw, df_objets_raw)
-    budget_map = budget_by_activity.set_index("activite_id")["budget_activite"]
-    df_acts_min["budget_activite"] = df_acts_min.index.astype(str).map(budget_map).fillna(0).astype(float)
-
     df_lois_min = minify_lois(df_lois)
 
+    print("5/ Construction docs + index lois", flush=True)
     # --- Docs lois
     df_lois_min = df_lois_min.reset_index(drop=True)  # index propre 0..N
     docs_lois = build_docs_lois(df_lois_min)
@@ -275,6 +244,7 @@ def build_all(cfg: BuildConfig) -> None:
     doc_ids = docs["activite_id"].to_numpy(dtype=object)
     doc_texts = docs["doc_text"].fillna("").astype(str).tolist()
 
+    print("6/ Sauvegarde artefacts tables + auxiliaires", flush=True)
     # 3) Save minified + nouvelles tables propres.
     save_parquet(df_acts_min, ART.df_activites_min)
     save_parquet(df_lois_min, ART.df_lois_min)
@@ -283,13 +253,27 @@ def build_all(cfg: BuildConfig) -> None:
     save_parquet(df_beneficiaires, "df_beneficiaires.parquet")
     save_parquet(df_observations, "df_observations.parquet")
 
+    print("7/ Construction df_beneficiaires_activites_globales", flush=True)
+    df_benef_global = _build_beneficiaires_activites_globales(
+        df_acts_min=df_acts_min,
+        df_observations=df_observations,
+        df_beneficiaires=df_beneficiaires,
+        df_exercices=df_exercices_raw,
+        df_objets=df_objets_raw,
+    )
+    save_parquet(df_benef_global, "df_beneficiaires_activites_globales.parquet")
+
+
+    print("8/ Construction BM25 activités", flush=True)
     # 4) BM25 activités
     bm25_bundle = build_bm25(doc_ids=doc_ids, doc_texts=doc_texts)
     save_joblib(bm25_bundle, ART.bm25_activites)
 
+    print("9/ Construction embeddings + FAISS", flush=True)
     # 5) Embeddings + FAISS (ACTIVITES + LOIS)
     model = SentenceTransformer(cfg.st_model)
 
+    print("9a/ Encodage activités", flush=True)
     # --- Activités
     emb = model.encode(doc_texts, batch_size=128, show_progress_bar=True, convert_to_numpy=True)
     emb = emb.astype("float32", copy=False)
@@ -303,10 +287,12 @@ def build_all(cfg: BuildConfig) -> None:
         normalize=cfg.normalize,
     )
     save_faiss(faiss_bundle.index, ART.faiss_activites)
+    print("9b/ FAISS activités sauvegardé", flush=True)
 
     id_map = pd.DataFrame({"pos": np.arange(len(doc_ids), dtype=int), "activite_id": doc_ids.astype(str)})
     save_parquet(id_map.set_index("pos"), ART.id_map_activites)
 
+    print("9c/ Encodage lois", flush=True)
     # --- Lois
     emb_lois = model.encode(loi_texts, batch_size=128, show_progress_bar=True, convert_to_numpy=True)
     emb_lois = emb_lois.astype("float32", copy=False)
@@ -323,7 +309,9 @@ def build_all(cfg: BuildConfig) -> None:
 
     id_map_lois = pd.DataFrame({"pos": np.arange(len(loi_ids), dtype=int), "loi_id": loi_ids.astype(str)})
     save_parquet(id_map_lois.set_index("pos"), ART.id_map_lois)
+    print("9d/ FAISS lois sauvegardé", flush=True)
 
+    print("10/ Écriture manifest", flush=True)
     # 6) manifest
     manifest = {
         "built_at": datetime.utcnow().isoformat() + "Z",
@@ -349,20 +337,11 @@ def build_all(cfg: BuildConfig) -> None:
             "df_beneficiaires_activites_globales": "df_beneficiaires_activites_globales.parquet",
         },
     }
-    
-    df_benef_global = _build_beneficiaires_activites_globales(
-        df_acts_min=df_acts_min,
-        df_observations=df_observations,
-        df_beneficiaires=df_beneficiaires,
-        df_exercices=df_exercices_raw,
-        df_objets=df_objets_raw,
-        )
-
-    save_parquet(df_benef_global, "df_beneficiaires_activites_globales.parquet")
     write_manifest(manifest)
 
 
 if __name__ == "__main__":
+    print("Début build_artifacts", flush=True)
     cfg = BuildConfig()
     build_all(cfg)
-    print("✅ Artifacts built in ./artifacts")
+    print("✅ Artifacts built in ./artifacts", flush=True)

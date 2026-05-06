@@ -66,10 +66,7 @@ def load_all():
     df_affiliations = load_parquet("df_affiliations.parquet")
     df_beneficiaires = load_parquet("df_beneficiaires.parquet")
     df_observations = load_parquet("df_observations.parquet")
-    try:
-        df_benef_global = load_parquet("df_beneficiaires_activites_globales.parquet")
-    except FileNotFoundError:
-        df_benef_global = pd.DataFrame(columns=["activite_id", "beneficiaire", "budget_activite"])
+    df_benef_global = load_parquet("df_beneficiaires_activites_globales.parquet")
 
     # rebuild FaissBundle doc_ids in index order
     doc_ids = id_map["activite_id"].astype(object).to_numpy()
