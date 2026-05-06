@@ -467,7 +467,15 @@ if "date_publication_activite" in show_display.columns:
 st.markdown("### Activités de lobbying correspondant à la recherche")
 st.markdown("Tous les budgets sont exprimés en €")
 st.markdown("Désélectionnez les activités que vous considérez non pertinentes pour votre recherche, puis validez")
-st.caption("les activités de lobbying sont réalisées directement par l'organisation déclarante, ou par des cabinets de conseil ou d'avocats agissant pour le compte de l'organisation déclarante. Le bénéficiaire est l'entité qui bénéficie de l'activité de lobbying, et peut être différent de l'organisation déclarante: sociétés de conseil pour un client, groupe pour une filiale...Nous privilégions dans l'analyse les bénéficiaires plustôt que les déclarantes ("bénéficiaire" versus "dénommination") ")
+st.caption(
+    "Les activités de lobbying sont réalisées directement par l'organisation déclarante, "
+    "ou par des cabinets de conseil ou d'avocats agissant pour le compte de l'organisation déclarante. "
+    "Le bénéficiaire est l'entité qui bénéficie de l'activité de lobbying, "
+    "et peut être différent de l'organisation déclarante : sociétés de conseil pour un client, "
+    "groupe pour une filiale… "
+    "Nous privilégions dans l'analyse les bénéficiaires plutôt que les déclarantes "
+    '(« bénéficiaire » versus « dénomination »).'
+)
 
 edited = st.data_editor(
     show_display,
