@@ -48,16 +48,6 @@ def _join_unique(values, max_items: int = 80) -> str:
     return "; ".join(out)
 
 
-
-
-def _explode_ids(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    out = df.copy()
-    out[col] = _norm_id_series(out[col])
-    out[col] = out[col].str.split(r"\s*[;,|,]\s*", regex=True)
-    out = out.explode(col)
-    out[col] = _norm_id_series(out[col])
-    return out.dropna(subset=[col])
-
 def to_int64_safe(series: pd.Series) -> pd.Series:
     return (
         pd.to_numeric(series, errors="coerce")
@@ -76,53 +66,6 @@ def _clean_money_series(s: pd.Series) -> pd.Series:
     # Si virgule décimale, conversion simple. Les montants sont normalement entiers.
     x = x.str.replace(",", ".", regex=False)
     return pd.to_numeric(x, errors="coerce")
-
-
-def _mean_multi_numeric_values(values) -> pd.NA | int:
-    """Moyenne des valeurs numériques connues, sans les sommer.
-
-    nombre_salaries est une caractéristique d'organisation, pas un flux.
-    Quand plusieurs valeurs apparaissent sous forme "23 ; 7", cela correspond
-    généralement à plusieurs exercices ou déclarations. Dans ce dataframe agrégé,
-    l'ordre chronologique n'est pas garanti; on prend donc la moyenne des valeurs
-    distinctes connues plutôt qu'une somme métier fausse.
-    """
-    parsed: list[float] = []
-    seen_values: set[float] = set()
-
-    for raw in pd.Series(values).dropna().astype(str):
-        raw = raw.strip()
-        if not raw or raw.lower() in {"nan", "none", "<na>"}:
-            continue
-
-        for part in re.split(r"\s*[;|]\s*", raw):
-            part = part.strip()
-            if not part:
-                continue
-            # La virgule peut être séparateur décimal; on ne l'utilise pas
-            # comme séparateur de valeurs pour éviter de casser "12,5".
-            value = pd.to_numeric(part.replace(" ", "").replace(",", "."), errors="coerce")
-            if pd.notna(value):
-                value = float(value)
-                if value not in seen_values:
-                    seen_values.add(value)
-                    parsed.append(value)
-
-    if not parsed:
-        return pd.NA
-    return int(round(float(np.mean(parsed))))
-
-
-def _format_date_columns_for_display(df: pd.DataFrame) -> pd.DataFrame:
-    """Affiche les colonnes de date en YYYY-MM-DD au lieu de timestamps ISO complets."""
-    out = df.copy()
-    for col in out.columns:
-        name = str(col).lower()
-        if "date" in name:
-            parsed = pd.to_datetime(out[col], errors="coerce", dayfirst=(out[col].dtype == object))
-            if parsed.notna().any():
-                out[col] = parsed.dt.strftime("%Y-%m-%d").where(parsed.notna(), "")
-    return out
 
 
 def read_table(path_or_file, *, default_sep: str = ";") -> pd.DataFrame:
@@ -368,11 +311,12 @@ def build_beneficiaire_global_stats(df_detail_global: pd.DataFrame) -> pd.DataFr
         df_detail_global.groupby("beneficiaire", dropna=False)
         .agg(
             nb_activites_total_beneficiaire=("activite_id", "nunique"),
+            nb_actions_total_beneficiaire=("action_representation_interet_id", "nunique"),
             budget_total_beneficiaire=("budget_activite", "sum"),
         )
         .reset_index()
     )
-    for col in ["nb_activites_total_beneficiaire", "budget_total_beneficiaire"]:
+    for col in ["nb_activites_total_beneficiaire", "nb_actions_total_beneficiaire", "budget_total_beneficiaire"]:
         out[col] = to_int64_safe(out[col])
     return out.sort_values("budget_total_beneficiaire", ascending=False)
 
@@ -477,11 +421,6 @@ acts_full_raw = load_from_candidates(
     "Base activités complète/minifiée, optionnel",
     ["/mnt/data/df_activites_min.parquet", "artifacts/df_activites_min.parquet", "df_activites_min.parquet"],
     "acts_full",
-)
-infos_raw = load_from_candidates(
-    "1_informations_generales, recommandé pour catégories/salariés",
-    ["/mnt/data/1_informations_generales.xlsx", "data/1_informations_generales.xlsx"],
-    "infos_generales",
 )
 
 if selected_raw is None or obs_raw is None or benef_raw is None:
@@ -588,325 +527,44 @@ col_dl4.download_button(
 )
 
 # -----------------------------------------------------------------------------
-# Sélection enrichie et analyses tabulaires : activités / organisations / bénéficiaires
+# Sélection enrichie et analyse bénéficiaire sur recherche
 # -----------------------------------------------------------------------------
-
-def _maybe_first_existing(cols: list[str], candidates: list[str]) -> Optional[str]:
-    return next((c for c in candidates if c in cols), None)
-
-
-def add_budget_activity_to_selection(selected_df: pd.DataFrame, budget_by_activity: pd.DataFrame) -> pd.DataFrame:
-    """Ajoute le budget canonique par activité calculé depuis 8_objets_activites + 15_exercices."""
-    out = ensure_activite_id(selected_df)
-    budget = budget_by_activity.copy()
-    budget["activite_id"] = _norm_id_series(budget["activite_id"])
-    budget["budget_activite"] = pd.to_numeric(budget["budget_activite"], errors="coerce")
-
-    out = out.merge(
-        budget[["activite_id", "budget_activite"]].drop_duplicates("activite_id"),
-        on="activite_id",
-        how="left",
-    )
-
-    # Dans cette app de test, les agrégations utilisent explicitement le budget recalculé.
-    out["budget_moyen_activite"] = out["budget_activite"]
-    return out
-
-
-def enrich_selection_with_activity_and_org_info(
-    selected_df: pd.DataFrame,
-    acts_full_df: Optional[pd.DataFrame],
-    infos_df: Optional[pd.DataFrame],
-) -> pd.DataFrame:
-    """Ajoute les colonnes d'organisation manquantes depuis df_activites_min et 1_informations_generales."""
-    out = ensure_activite_id(selected_df)
-
-    # Complément depuis df_activites_min / base activités complète, par activite_id.
-    if acts_full_df is not None and not acts_full_df.empty:
-        acts = ensure_activite_id(acts_full_df)
-        keep = [
-            c for c in [
-                "activite_id",
-                "representants_id",
-                "label_categorie_organisation",
-                "nombre_salaries",
-                "nb_activites_total",
-                "budget_total",
-            ] if c in acts.columns
-        ]
-        if len(keep) > 1:
-            right = acts[keep].drop_duplicates("activite_id")
-            out = out.merge(right, on="activite_id", how="left", suffixes=("", "_acts"))
-            for c in [x for x in keep if x != "activite_id"]:
-                c_acts = f"{c}_acts"
-                if c_acts in out.columns:
-                    if c in out.columns:
-                        out[c] = out[c].where(out[c].notna() & (out[c].astype("string").str.strip() != ""), out[c_acts])
-                        out = out.drop(columns=[c_acts])
-                    else:
-                        out = out.rename(columns={c_acts: c})
-
-    # Complément depuis 1_informations_generales, par representants_id.
-    if infos_df is not None and not infos_df.empty and "representants_id" in out.columns and "representants_id" in infos_df.columns:
-        wanted = [
-            c for c in [
-                "representants_id",
-                "label_categorie_organisation",
-                "nombre_salaries",
-                "denomination",
-            ] if c in infos_df.columns
-        ]
-        infos = infos_df[wanted].copy()
-        infos = _explode_ids(infos, "representants_id")
-        rename = {}
-        if "label_categorie_organisation" in infos.columns:
-            rename["label_categorie_organisation"] = "categorie_info"
-        if "nombre_salaries" in infos.columns:
-            rename["nombre_salaries"] = "nombre_salaries_info"
-        infos = infos.rename(columns=rename)
-        agg = {}
-        if "categorie_info" in infos.columns:
-            agg["categorie_info"] = ("categorie_info", lambda s: _join_unique(s, max_items=20))
-        if "nombre_salaries_info" in infos.columns:
-            agg["nombre_salaries_info"] = ("nombre_salaries_info", lambda s: _join_unique(s, max_items=20))
-        if agg:
-            infos_by_rep = infos.groupby("representants_id", dropna=False).agg(**agg).reset_index()
-
-            base = out.copy()
-            base = _explode_ids(base, "representants_id")
-            mapped = base[["activite_id", "representants_id"]].merge(infos_by_rep, on="representants_id", how="left")
-            by_act = mapped.groupby("activite_id", dropna=False).agg(
-                **{c: (c, lambda s: _join_unique(s, max_items=20)) for c in ["categorie_info", "nombre_salaries_info"] if c in mapped.columns}
-            ).reset_index()
-            out = out.merge(by_act, on="activite_id", how="left")
-            if "categorie_info" in out.columns:
-                if "label_categorie_organisation" in out.columns:
-                    out["label_categorie_organisation"] = out["label_categorie_organisation"].where(
-                        out["label_categorie_organisation"].notna() & (out["label_categorie_organisation"].astype("string").str.strip() != ""),
-                        out["categorie_info"],
-                    )
-                else:
-                    out["label_categorie_organisation"] = out["categorie_info"]
-                out = out.drop(columns=["categorie_info"])
-            if "nombre_salaries_info" in out.columns:
-                if "nombre_salaries" in out.columns:
-                    out["nombre_salaries"] = out["nombre_salaries"].where(
-                        out["nombre_salaries"].notna() & (out["nombre_salaries"].astype("string").str.strip() != ""),
-                        out["nombre_salaries_info"],
-                    )
-                else:
-                    out["nombre_salaries"] = out["nombre_salaries_info"]
-                out = out.drop(columns=["nombre_salaries_info"])
-
-    return out
-
-
-def build_affiliations_by_org(selected_df: pd.DataFrame, affiliations_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Agrège les affiliations au niveau organisation déclarante.
-
-    Jointure principale : selected_df.representants_id -> 5_affiliations.representants_id.
-    Les IDs peuvent être multi-valués; on les éclate avant jointure.
-    """
-    if affiliations_df is None or affiliations_df.empty:
-        return pd.DataFrame()
-
-    if "denomination" not in selected_df.columns:
-        return pd.DataFrame()
-
-    selected_id_col = _maybe_first_existing(
-        list(selected_df.columns),
-        ["representants_id", "representant_id", "id_representant"],
-    )
-    aff_id_col = _maybe_first_existing(
-        list(affiliations_df.columns),
-        ["representants_id", "representant_id", "id_representant"],
-    )
-    aff_col = _maybe_first_existing(
-        list(affiliations_df.columns),
-        ["denomination_affiliation", "affiliation", "nom_affiliation", "nom_prenoms_affiliation", "denomination"],
-    )
-
-    if selected_id_col is None or aff_id_col is None or aff_col is None:
-        return pd.DataFrame()
-
-    org_ids = (
-        selected_df[["denomination", selected_id_col]]
-        .dropna(subset=["denomination"])
-        .drop_duplicates()
-        .rename(columns={selected_id_col: "representants_id"})
-    )
-    org_ids = _explode_ids(org_ids, "representants_id")
-
-    aff = (
-        affiliations_df[[aff_id_col, aff_col]]
-        .copy()
-        .rename(columns={aff_id_col: "representants_id", aff_col: "affiliations"})
-    )
-    aff = _explode_ids(aff, "representants_id")
-    aff["affiliations"] = aff["affiliations"].astype("string").str.strip()
-    aff = aff.dropna(subset=["representants_id", "affiliations"]).drop_duplicates()
-
-    detail = org_ids.merge(aff[["representants_id", "affiliations"]], on="representants_id", how="inner")
-    if detail.empty:
-        return pd.DataFrame()
-
-    return (
-        detail.groupby("denomination", dropna=False)
-        .agg(
-            nb_affiliations=("affiliations", "nunique"),
-            affiliations=("affiliations", lambda s: _join_unique(s, max_items=120)),
-        )
-        .reset_index()
-    )
-
-
-def build_organisation_table(selected_enriched: pd.DataFrame, affiliations_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    df = selected_enriched.copy()
-    df["budget_activite"] = pd.to_numeric(df.get("budget_activite", df.get("budget_moyen_activite", 0)), errors="coerce")
-
-    agg = {
-        "nb_activites_matching": ("activite_id", "nunique"),
-        "budget_estime_recherche": ("budget_activite", "sum"),
-    }
-
-    if "label_categorie_organisation" in df.columns:
-        agg["categorie"] = ("label_categorie_organisation", lambda s: _join_unique(s, max_items=20))
-    if "nb_activites_total" in df.columns:
-        agg["nb_activites_total"] = ("nb_activites_total", "max")
-    if "budget_total" in df.columns:
-        agg["budget_total"] = ("budget_total", "max")
-    if "nombre_salaries" in df.columns:
-        agg["nombre_salaries"] = ("nombre_salaries", _mean_multi_numeric_values)
-
-    out = df.groupby("denomination", dropna=False).agg(**agg).reset_index()
-
-    affiliations = build_affiliations_by_org(df, affiliations_df)
-    if not affiliations.empty:
-        out = out.merge(affiliations, on="denomination", how="left")
-
-    for col in [
-        "nb_activites_matching", "budget_estime_recherche", "nb_activites_total",
-        "budget_total", "nombre_salaries", "nb_affiliations",
-    ]:
-        if col in out.columns:
-            out[col] = to_int64_safe(out[col])
-
-    display_cols = [
-        "denomination",
-        "categorie",
-        "nb_activites_matching",
-        "budget_estime_recherche",
-        "budget_total",
-        "nb_activites_total",
-        "nombre_salaries",
-        "nb_affiliations",
-        "affiliations",
-    ]
-    out = out[[c for c in display_cols if c in out.columns]]
-    return out.sort_values("budget_estime_recherche", ascending=False)
-
-
-def build_beneficiaire_table(selected_enriched: pd.DataFrame, global_stats: pd.DataFrame) -> pd.DataFrame:
-    df = selected_enriched.copy()
-    df["budget_activite"] = pd.to_numeric(df.get("budget_activite", df.get("budget_moyen_activite", 0)), errors="coerce")
-
-    out = (
-        df.groupby("beneficiaire", dropna=False)
-        .agg(
-            nb_activites_matching=("activite_id", "nunique"),
-            budget_estime_recherche=("budget_activite", "sum"),
-        )
-        .reset_index()
-    )
-
-    if global_stats is not None and not global_stats.empty:
-        out = out.merge(global_stats, on="beneficiaire", how="left")
-
-    for col in [
-        "nb_activites_matching", "budget_estime_recherche",
-        "nb_activites_total_beneficiaire", "budget_total_beneficiaire",
-    ]:
-        if col in out.columns:
-            out[col] = to_int64_safe(out[col])
-
-    display_cols = [
-        "beneficiaire",
-        "nb_activites_matching",
-        "budget_estime_recherche",
-        "budget_total_beneficiaire",
-        "nb_activites_total_beneficiaire",
-    ]
-    out = out[[c for c in display_cols if c in out.columns]]
-    return out.sort_values("budget_estime_recherche", ascending=False)
-
-
 st.markdown("## 3. Test sur les activités sélectionnées")
-
-# Optionnel : affiliations. Si absentes, le tableau organisations fonctionne quand même.
-affiliations_raw = load_from_candidates(
-    "5_affiliations / df_affiliations, optionnel",
-    ["/mnt/data/5_affiliations.xlsx", "data/5_affiliations.xlsx", "df_affiliations.parquet", "artifacts/df_affiliations.parquet"],
-    "affiliations",
-)
-
 try:
-    selected_with_budget = add_budget_activity_to_selection(selected_raw, budget_by_activity)
-    selected_with_org_info = enrich_selection_with_activity_and_org_info(selected_with_budget, acts_full_raw, infos_raw)
-    selected_enriched = add_beneficiaire_column_to_selection(selected_with_org_info, obs_raw, benef_raw)
-    organisation_budget = build_organisation_table(selected_enriched, affiliations_raw)
-    beneficiaire_budget = build_beneficiaire_table(selected_enriched, global_stats)
+    selected_enriched = add_beneficiaire_column_to_selection(selected_raw, obs_raw, benef_raw)
+    selected_budget = build_selected_beneficiaire_budget(selected_enriched, global_stats)
 except Exception as e:
-    st.error(f"Erreur analyses tabulaires: {e}")
+    st.error(f"Erreur sélection enrichie: {e}")
     st.stop()
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3 = st.columns(3)
 c1.metric("Activités sélectionnées", len(selected_enriched))
-c2.metric("Organisations", int(selected_enriched["denomination"].nunique()) if "denomination" in selected_enriched.columns else 0)
-c3.metric("Bénéficiaires", int(selected_enriched["beneficiaire"].nunique()))
-c4.metric("Sans bénéficiaire déclaré", int(selected_enriched.get("nb_beneficiaires", pd.Series([pd.NA] * len(selected_enriched))).isna().sum()))
+c2.metric("Bénéficiaires sélection", int(selected_enriched["beneficiaire"].nunique()))
+c3.metric("Sans bénéficiaire déclaré", int(selected_enriched.get("nb_beneficiaires", pd.Series([pd.NA]*len(selected_enriched))).isna().sum()))
 
-st.markdown("### 3.1 Activités")
-activites_cols = [
-    "activite_id",
-    "objet_activite",
-    "denomination",
-    "beneficiaire",
-    "nb_beneficiaires",
-    "date_publication_activite",
-    "budget_activite",
-    "domaines",
-]
-activites_display = selected_enriched[[c for c in activites_cols if c in selected_enriched.columns]]
-activites_display = _format_date_columns_for_display(activites_display)
-st.dataframe(activites_display, use_container_width=True)
+with st.expander("Activités sélectionnées enrichies", expanded=True):
+    priority = [
+        "activite_id", "objet_activite", "denomination", "beneficiaire", "nb_beneficiaires",
+        "date_publication_activite", "budget_moyen_activite", "budget_total", "domaines", "label_categorie_organisation"
+    ]
+    st.dataframe(selected_enriched[[c for c in priority if c in selected_enriched.columns] + [c for c in selected_enriched.columns if c not in priority]].head(200), use_container_width=True)
 
-st.markdown("### 3.2 Organisations déclarantes")
-st.caption("Niveau denomination : budget, activité totale, salariés, catégorie et affiliations agrégées. nombre_salaries est une moyenne des valeurs distinctes connues lorsqu’il existe plusieurs exercices.")
-st.dataframe(organisation_budget, use_container_width=True)
+st.markdown("### Analyse budget par bénéficiaire sur la sélection + stats globales")
+st.dataframe(selected_budget, use_container_width=True)
 
-st.markdown("### 3.3 Bénéficiaires")
-st.caption("Niveau beneficiaire : sans colonne denomination, pour éviter les ambiguïtés lorsqu'un bénéficiaire est lié à plusieurs organisations déclarantes.")
-st.dataframe(beneficiaire_budget, use_container_width=True)
-
-col_dl1, col_dl2, col_dl3 = st.columns(3)
-col_dl1.download_button(
-    "Télécharger activités enrichies CSV",
-    data=df_to_csv_bytes(activites_display),
-    file_name="test_activites_enrichies.csv",
+st.download_button(
+    "Télécharger activités sélectionnées enrichies CSV",
+    data=df_to_csv_bytes(selected_enriched),
+    file_name="activites_selectionnees_enrichies_beneficiaires.csv",
     mime="text/csv",
 )
-col_dl2.download_button(
-    "Télécharger organisations CSV",
-    data=df_to_csv_bytes(organisation_budget),
-    file_name="test_organisations.csv",
+st.download_button(
+    "Télécharger analyse sélection bénéficiaires CSV",
+    data=df_to_csv_bytes(selected_budget),
+    file_name="analyse_selection_beneficiaires.csv",
     mime="text/csv",
 )
-col_dl3.download_button(
-    "Télécharger bénéficiaires CSV",
-    data=df_to_csv_bytes(beneficiaire_budget),
-    file_name="test_beneficiaires.csv",
-    mime="text/csv",
-)
+
 
 
 # -----------------------------------------------------------------------------
@@ -1104,7 +762,7 @@ else:
     st.plotly_chart(figm, use_container_width=True)
 
 st.markdown("## 5. Chronologie activités & lois")
-st.caption("Dans ce test sans FAISS, les lois proviennent d’un fichier chargé si disponible. Dès qu’un tableau de lois existe, ses dates sont nettoyées systématiquement en YYYY-MM-DD.")
+st.caption("Dans ce test, les lois ne sont affichées que si vous chargez un fichier déjà sélectionné. En prod, la sélection lois restera pilotée par la recherche.")
 lois_test = load_from_candidates(
     "Lois sélectionnées pour frise, optionnel",
     ["/mnt/data/lois_selectionnees.csv", "lois_selectionnees.csv", "data/lois_selectionnees.csv"],
@@ -1124,9 +782,7 @@ acts["x"] = (np.sqrt(m.fillna(0) + 1) / np.sqrt(mmax + 1) * 6.0) + 1.0
 acts["x"] = acts["label_full"].apply(lambda s: stable_jitter(str(s), 0.25)) + acts["x"]
 
 if lois_test is not None and not lois_test.empty:
-    laws = _format_date_columns_for_display(lois_test.copy())
-    st.markdown("#### Lois correspondant à la recherche")
-    st.dataframe(laws, use_container_width=True)
+    laws = lois_test.copy()
     date_col = "Date initiale" if "Date initiale" in laws.columns else ("date_evt" if "date_evt" in laws.columns else None)
     if date_col:
         laws["date_evt"] = pd.to_datetime(laws.get(date_col), errors="coerce", dayfirst=True)
@@ -1179,10 +835,6 @@ st.plotly_chart(figt, use_container_width=True)
 st.markdown("## 6. Payload et appel LLM")
 requete_test = st.text_input("Requête test pour le payload LLM", value="")
 info_llm = build_llm_payload(selected_enriched, global_stats, requete_test)
-st.caption(
-    "Payload LLM conservé : contexte, tableau_beneficiaires, "
-    "tableau_beneficiaires_domaines, tableau_domaines, activites_selectionnees."
-)
 st.json(info_llm, expanded=False)
 
 st.download_button(
