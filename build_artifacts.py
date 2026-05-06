@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime
+import argparse
 import numpy as np
 import pandas as pd
 
@@ -10,7 +11,7 @@ from src.config import PATHS, ART
 from src.prep import prepare_from_raw, minify_activites, minify_lois, build_docs_activites, build_docs_lois
 from src.bm25_index import build_bm25
 from src.embed_index import build_faiss_ivfpq
-from src.io_artifacts import save_parquet, save_joblib, save_faiss, write_manifest
+from src.io_artifacts import save_parquet, save_joblib, save_faiss, write_manifest, load_parquet
 
 
 @dataclass
@@ -185,6 +186,55 @@ def _build_beneficiaires_activites_globales(
     # --- FINAL
     return mapping.merge(budget_by_activity, on="activite_id", how="left")
 
+
+def build_auxiliary_artifacts() -> None:
+    """Reconstruit uniquement les petits artefacts auxiliaires, sans BM25 ni FAISS.
+
+    Utile sur Render pour corriger les bénéficiaires/affiliations sans relancer
+    les embeddings et l'index FAISS.
+    """
+    print("AUX 1/ Lecture tables auxiliaires HATVP", flush=True)
+    df_exercices_raw = _read_raw_xlsx("15_exercices.xlsx")
+    df_objets_raw = _read_raw_xlsx("8_objets_activites.xlsx")
+    df_affiliations_raw = _read_raw_xlsx("5_affiliations.xlsx")
+    df_beneficiaires_raw = _read_raw_xlsx("11_beneficiaires.xlsx")
+    df_observations_raw = _read_raw_xlsx("14_observations.xlsx")
+
+    df_affiliations, df_beneficiaires, df_observations = _normalise_auxiliary_tables(
+        df_affiliations_raw,
+        df_beneficiaires_raw,
+        df_observations_raw,
+    )
+
+    print("AUX 2/ Sauvegarde df_affiliations / df_beneficiaires / df_observations", flush=True)
+    save_parquet(df_affiliations, "df_affiliations.parquet")
+    save_parquet(df_beneficiaires, "df_beneficiaires.parquet")
+    save_parquet(df_observations, "df_observations.parquet")
+
+    try:
+        df_acts_min = load_parquet(ART.df_activites_min)
+    except FileNotFoundError:
+        df_acts_min = pd.DataFrame()
+
+    print("AUX 3/ Construction df_beneficiaires_activites_globales", flush=True)
+    df_benef_global = _build_beneficiaires_activites_globales(
+        df_acts_min=df_acts_min,
+        df_observations=df_observations,
+        df_beneficiaires=df_beneficiaires,
+        df_exercices=df_exercices_raw,
+        df_objets=df_objets_raw,
+    )
+    save_parquet(df_benef_global, "df_beneficiaires_activites_globales.parquet")
+
+    print(
+        "✅ Aux artifacts built: "
+        f"affiliations={len(df_affiliations)}, "
+        f"beneficiaires={len(df_beneficiaires)}, "
+        f"observations={len(df_observations)}, "
+        f"benef_global={len(df_benef_global)}",
+        flush=True,
+    )
+
 def build_all(cfg: BuildConfig) -> None:
     print("1/ Préparation coeur activités + lois", flush=True)
     # 1) Prepare coeur historique: activités, lois, BM25, FAISS.
@@ -341,7 +391,19 @@ def build_all(cfg: BuildConfig) -> None:
 
 
 if __name__ == "__main__":
-    print("Début build_artifacts", flush=True)
-    cfg = BuildConfig()
-    build_all(cfg)
-    print("✅ Artifacts built in ./artifacts", flush=True)
+    parser = argparse.ArgumentParser(description="Build LobbySearch artifacts")
+    parser.add_argument(
+        "--aux-only",
+        action="store_true",
+        help="Reconstruit seulement les petits artefacts auxiliaires, sans BM25/FAISS.",
+    )
+    args = parser.parse_args()
+
+    if args.aux_only:
+        print("Début build_artifacts --aux-only", flush=True)
+        build_auxiliary_artifacts()
+    else:
+        print("Début build_artifacts", flush=True)
+        cfg = BuildConfig()
+        build_all(cfg)
+        print("✅ Artifacts built in ./artifacts", flush=True)

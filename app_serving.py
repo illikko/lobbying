@@ -14,6 +14,34 @@ import plotly.express as px
 from rank_bm25 import BM25Okapi
 from src.textnorm import tokenize
 from sentence_transformers import SentenceTransformer
+from pathlib import Path
+
+
+def load_parquet_optional(name: str) -> pd.DataFrame:
+    """Charge un parquet d'artefact si présent, sinon retourne un DataFrame vide.
+
+    Permet à l'app de rester compatible avec les artefacts Render existants
+    quand les petits artefacts auxiliaires n'ont pas encore été générés.
+    """
+    try:
+        return load_parquet(name)
+    except FileNotFoundError:
+        return pd.DataFrame()
+
+
+def load_raw_xlsx_optional(filename: str, columns: list[str] | None = None) -> pd.DataFrame:
+    """Fallback léger depuis data/raw, sans FAISS ni rebuild complet."""
+    path = Path("data/raw") / filename
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_excel(path, dtype=str)
+        if columns is not None:
+            keep = [c for c in columns if c in df.columns]
+            return df[keep].copy() if keep else pd.DataFrame()
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 # application Streamlit
@@ -63,10 +91,28 @@ def load_all():
     bm25_lois_bundle = load_joblib(ART.bm25_lois)
     faiss_lois_index = load_faiss(ART.faiss_lois)
     id_map_lois = load_parquet(ART.id_map_lois)
-    df_affiliations = load_parquet("df_affiliations.parquet")
-    df_beneficiaires = load_parquet("df_beneficiaires.parquet")
-    df_observations = load_parquet("df_observations.parquet")
-    df_benef_global = load_parquet("df_beneficiaires_activites_globales.parquet")
+    df_affiliations = load_parquet_optional("df_affiliations.parquet")
+    if df_affiliations.empty:
+        df_affiliations = load_raw_xlsx_optional(
+            "5_affiliations.xlsx",
+            ["representants_id", "denomination_affiliation"],
+        )
+
+    df_beneficiaires = load_parquet_optional("df_beneficiaires.parquet")
+    if df_beneficiaires.empty:
+        df_beneficiaires = load_raw_xlsx_optional(
+            "11_beneficiaires.xlsx",
+            ["action_representation_interet_id", "beneficiaire_action_menee"],
+        )
+
+    df_observations = load_parquet_optional("df_observations.parquet")
+    if df_observations.empty:
+        df_observations = load_raw_xlsx_optional(
+            "14_observations.xlsx",
+            ["activite_id", "action_representation_interet_id"],
+        )
+
+    df_benef_global = load_parquet_optional("df_beneficiaires_activites_globales.parquet")
 
     # rebuild FaissBundle doc_ids in index order
     doc_ids = id_map["activite_id"].astype(object).to_numpy()
@@ -165,7 +211,16 @@ def build_affiliations_organisations(org_search: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_beneficiaires_activites(selected_res: pd.DataFrame) -> pd.DataFrame:
-    """Bénéficiaires au niveau activité: activite_id -> observations -> beneficiaires."""
+    """Bénéficiaires au niveau activité.
+
+    Jointure canonique validée dans app_serving_test.py:
+    selected.activite_id -> 14_observations.activite_id
+    -> action_representation_interet_id -> 11_beneficiaires.
+
+    Important: le résultat est agrégé par activite_id uniquement. Ne jamais
+    refusionner par denomination/objet_activite, car ces champs ne sont pas
+    des clés et peuvent rattacher les bénéficiaires à la mauvaise activité.
+    """
     if selected_res is None or selected_res.empty:
         return pd.DataFrame()
     required_obs = {"activite_id", "action_representation_interet_id"}
@@ -177,33 +232,31 @@ def build_beneficiaires_activites(selected_res: pd.DataFrame) -> pd.DataFrame:
 
     acts = selected_res.copy()
     if "activite_id" not in acts.columns:
-        acts = acts.reset_index().rename(columns={"index": "activite_id"})
+        acts = acts.reset_index().rename(columns={acts.index.name or "index": "activite_id"})
     acts["activite_id"] = _norm_id_series(acts["activite_id"])
+    selected_ids = set(acts["activite_id"].dropna())
 
     obs = df_observations[["activite_id", "action_representation_interet_id"]].copy()
     obs["activite_id"] = _norm_id_series(obs["activite_id"])
     obs["action_representation_interet_id"] = _norm_id_series(obs["action_representation_interet_id"])
-    obs = obs[obs["activite_id"].isin(set(acts["activite_id"].dropna()))].drop_duplicates()
+    obs = obs[obs["activite_id"].isin(selected_ids)].dropna().drop_duplicates()
 
     benef = df_beneficiaires[["action_representation_interet_id", "beneficiaire_action_menee"]].copy()
     benef["action_representation_interet_id"] = _norm_id_series(benef["action_representation_interet_id"])
     benef["beneficiaire_action_menee"] = benef["beneficiaire_action_menee"].astype("string").str.strip()
+    benef = benef.dropna(subset=["action_representation_interet_id", "beneficiaire_action_menee"]).drop_duplicates()
 
-    detail = (
-        obs.merge(benef, on="action_representation_interet_id", how="inner")
-           .merge(acts[["activite_id", "denomination", "objet_activite"]].drop_duplicates(), on="activite_id", how="left")
-    )
+    detail = obs.merge(benef, on="action_representation_interet_id", how="inner")
     if detail.empty:
         return pd.DataFrame()
 
     return (
-        detail.groupby(["denomination", "objet_activite"], dropna=False)
+        detail.groupby("activite_id", dropna=False)
         .agg(
             nb_beneficiaires=("beneficiaire_action_menee", "nunique"),
             beneficiaire_action_menee=("beneficiaire_action_menee", lambda s: _join_unique(s, max_items=80)),
         )
         .reset_index()
-        .sort_values(["nb_beneficiaires", "denomination"], ascending=[False, True])
     )
 
 def add_beneficiaire_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -211,18 +264,22 @@ def add_beneficiaire_column(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     out = df.copy()
+    if "activite_id" not in out.columns:
+        out = out.reset_index().rename(columns={out.index.name or "index": "activite_id"})
+    out["activite_id"] = _norm_id_series(out["activite_id"])
     benef = build_beneficiaires_activites(out)
 
     if not benef.empty:
         out = out.merge(
-            benef[["denomination", "objet_activite", "beneficiaire_action_menee", "nb_beneficiaires"]],
-            on=["denomination", "objet_activite"],
+            benef[["activite_id", "beneficiaire_action_menee", "nb_beneficiaires"]],
+            on="activite_id",
             how="left",
         )
-        out["beneficiaire"] = out["beneficiaire_action_menee"].fillna(out["denomination"])
+        fallback = out["denomination"] if "denomination" in out.columns else pd.Series([pd.NA] * len(out), index=out.index)
+        out["beneficiaire"] = out["beneficiaire_action_menee"].fillna(fallback)
         out = out.drop(columns=["beneficiaire_action_menee"], errors="ignore")
     else:
-        out["beneficiaire"] = out["denomination"]
+        out["beneficiaire"] = out["denomination"] if "denomination" in out.columns else pd.NA
         out["nb_beneficiaires"] = pd.NA
 
     return out
