@@ -583,64 +583,52 @@ st.dataframe(org_search, use_container_width=True)
 # =========================
 st.markdown("#### Activités de lobbying par bénéficiaire")
 
-# On reconstruit le tableau bénéficiaires depuis la sélection courante,
-# avec la même base d'activités que les tableaux activités / organisations / matrice.
-# df_benef_global reste utilisé uniquement pour les statistiques globales tous sujets.
-obs_sel = df_observations[["activite_id", "action_representation_interet_id"]].copy()
-obs_sel["activite_id"] = _norm_id_series(obs_sel["activite_id"])
-obs_sel["action_representation_interet_id"] = _norm_id_series(obs_sel["action_representation_interet_id"])
-obs_sel = obs_sel[obs_sel["activite_id"].isin(set(df_tmp["activite_id"].dropna()))].drop_duplicates()
+# Source de vérité: la sélection déjà enrichie affichée dans le tableau activités.
+# Ne pas repartir de df_benef_global filtré par activite_id: selon l'origine de la
+# recherche, l'index peut être ambigu, et cela peut ramener des bénéficiaires hors sélection.
+benef_tmp = df_tmp.copy()
 
-benef_map = df_beneficiaires[["action_representation_interet_id", "beneficiaire_action_menee"]].copy()
-benef_map["action_representation_interet_id"] = _norm_id_series(benef_map["action_representation_interet_id"])
-benef_map["beneficiaire"] = benef_map["beneficiaire_action_menee"].astype("string").str.strip()
-benef_map = benef_map.dropna(subset=["action_representation_interet_id", "beneficiaire"])
-benef_map = benef_map.drop_duplicates(subset=["action_representation_interet_id", "beneficiaire"])
+if "beneficiaire" not in benef_tmp.columns:
+    benef_tmp["beneficiaire"] = benef_tmp.get("denomination", pd.Series([pd.NA] * len(benef_tmp)))
 
-activity_budget = df_tmp[["activite_id", budget_col]].drop_duplicates("activite_id").copy()
-activity_budget[budget_col] = pd.to_numeric(activity_budget[budget_col], errors="coerce").fillna(0)
+benef_tmp["beneficiaire"] = benef_tmp["beneficiaire"].fillna(benef_tmp.get("denomination", ""))
+benef_tmp["beneficiaire"] = benef_tmp["beneficiaire"].astype("string").str.strip()
 
-benef_detail = (
-    obs_sel.merge(
-        benef_map[["action_representation_interet_id", "beneficiaire"]],
-        on="action_representation_interet_id",
-        how="inner",
+# Une activité peut avoir plusieurs bénéficiaires concaténés par _join_unique avec ";".
+# On explose pour agréger réellement au niveau bénéficiaire.
+benef_tmp["beneficiaire"] = benef_tmp["beneficiaire"].str.split(r"\s*;\s*", regex=True)
+benef_tmp = benef_tmp.explode("beneficiaire")
+benef_tmp["beneficiaire"] = benef_tmp["beneficiaire"].astype("string").str.strip()
+benef_tmp = benef_tmp[
+    benef_tmp["beneficiaire"].notna()
+    & (benef_tmp["beneficiaire"] != "")
+    & (~benef_tmp["beneficiaire"].str.lower().isin(["nan", "none", "<na>"]))
+].copy()
+
+benef_budget_col = _activity_budget_column(benef_tmp)
+benef_tmp[benef_budget_col] = pd.to_numeric(
+    benef_tmp.get(benef_budget_col, 0),
+    errors="coerce",
+).fillna(0)
+
+benef_search = (
+    benef_tmp.groupby("beneficiaire", dropna=False)
+    .agg(
+        nb_activites_matching=("activite_id", "nunique"),
+        budget_estime_recherche=(benef_budget_col, "sum"),
     )
-    .merge(activity_budget, on="activite_id", how="left")
-    .drop_duplicates(subset=["activite_id", "beneficiaire"])
+    .reset_index()
 )
 
-if not benef_detail.empty:
-    benef_search = (
-        benef_detail.groupby("beneficiaire", dropna=False)
-        .agg(
-            nb_activites_matching=("activite_id", "nunique"),
-            budget_estime_recherche=(budget_col, "sum"),
-        )
-        .reset_index()
-    )
-else:
-    # Fallback si aucune table bénéficiaire n'est exploitable : on retombe sur la colonne déjà enrichie.
-    fallback = df_tmp.copy()
-    benef_col = "beneficiaire" if "beneficiaire" in fallback.columns else "denomination"
-    benef_search = (
-        fallback.groupby(benef_col, dropna=False)
-        .agg(
-            nb_activites_matching=("activite_id", "nunique"),
-            budget_estime_recherche=(budget_col, "sum"),
-        )
-        .reset_index()
-        .rename(columns={benef_col: "beneficiaire"})
-    )
-
-benef_global = df_benef_global.copy()
-if "activite_id" in benef_global.columns:
-    benef_global["activite_id"] = _norm_id_series(benef_global["activite_id"])
-if "budget_activite" in benef_global.columns:
-    benef_global["budget_activite"] = pd.to_numeric(benef_global["budget_activite"], errors="coerce").fillna(0)
-
-benef_stats = build_beneficiaire_stats(benef_global)
-benef_search = benef_search.merge(benef_stats, on="beneficiaire", how="left")
+# Stats globales tous sujets: uniquement pour compléter les colonnes globales.
+# Elles ne déterminent jamais la liste des bénéficiaires affichés pour la recherche.
+if isinstance(df_benef_global, pd.DataFrame) and not df_benef_global.empty:
+    benef_global = df_benef_global.copy()
+    if "budget_activite" in benef_global.columns:
+        benef_global["budget_activite"] = pd.to_numeric(benef_global["budget_activite"], errors="coerce").fillna(0)
+    if {"beneficiaire", "activite_id", "budget_activite"}.issubset(benef_global.columns):
+        benef_stats = build_beneficiaire_stats(benef_global)
+        benef_search = benef_search.merge(benef_stats, on="beneficiaire", how="left")
 
 for col in [
     "nb_activites_matching",
@@ -661,6 +649,7 @@ benef_cols = [
 benef_search = benef_search[[c for c in benef_cols if c in benef_search.columns]]
 benef_search = benef_search.sort_values("budget_estime_recherche", ascending=False)
 st.dataframe(benef_search, use_container_width=True)
+
 
 # =========================
 # MATRICE BULLES org x domaines - SUR selected_res
