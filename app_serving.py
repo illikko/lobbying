@@ -24,10 +24,11 @@ if "results" not in st.session_state:
     st.session_state.results = None
 
 with st.expander("ℹ️ À propos de l'application", expanded=False):
-        st.write("""
+        st.markdown("""
         Cette application permet de cartographier les activités de lobbying en France.  
         Elle utilise une recherche hybride lexicale et sémantique pour trouver les activités les plus pertinentes par rapport à une requête comprenant plusieurs mots clé ou une/plusieurs phrases.  
         &nbsp;&nbsp;&nbsp;&nbsp; par exemple: transport, fret, fiscalité  
+
         Les résultats de la recherche sont présentés sous forme de:  
         • tableau avec des filtres interactifs  
         • matrice à bulles représentant les organisations et les domaines d'activité  
@@ -35,12 +36,13 @@ with st.expander("ℹ️ À propos de l'application", expanded=False):
         • synthèse par IA des activités de lobbying  
         
         Elle utilise les données ouvertes de la HATPV sur les activités de lobbying (environ 100K activités) et les lois du Sénat (envrion 6000 lois).
+
         L'application est à un stade d'expérimentation, et évolue en fonction des retours de ses utilisateurs.
         Elle est développée par Vincent Castaignet, un data analyst/scientist freelance.
         """)
 
 with st.expander("ℹ️ Comment ça marche ?", expanded=False):
-        st.write("""
+        st.mardown("""
         • écrire les mots clés recherchés ou les phrases dans le formulaire "mots-clés / requête", puis cliquer sur "Lancer" pour obtenir les résultats de recherche  
         • lire les résultats (objet_activite), et dé-sélectionner les activités qui ne sont pas pertinentes (colonne "Sélection"), puis cliquer sur "Valider la sélection" pour confirmer les activités retenues  
         • faire de même pour les lois correspondant à la recherche (dé-sélectionner les lois non pertinentes, puis valider)  
@@ -384,6 +386,47 @@ def to_int64_safe(series: pd.Series) -> pd.Series:
         .astype("Int64")
     )
 
+
+def _activity_budget_column(df: pd.DataFrame) -> str:
+    """Colonne budget au niveau activité: artefact dédié si présent, sinon colonne historique."""
+    if "budget_activite" in df.columns:
+        return "budget_activite"
+    return "budget_moyen_activite"
+
+
+def _parse_numeric_values(value) -> list[float]:
+    """Extrait des nombres depuis des champs comme '23 ; 7'."""
+    if pd.isna(value):
+        return []
+    values = []
+    for part in re.split(r"[;,|]", str(value)):
+        part = part.strip().replace("\u00a0", " ").replace(" ", "").replace(",", ".")
+        if not part:
+            continue
+        try:
+            values.append(float(part))
+        except ValueError:
+            continue
+    return values
+
+
+def _mean_distinct_numeric(values) -> float:
+    """Moyenne des valeurs numériques distinctes connues, sans additionner des exercices."""
+    nums = []
+    seen = set()
+    for value in values:
+        for num in _parse_numeric_values(value):
+            key = round(float(num), 6)
+            if key not in seen:
+                seen.add(key)
+                nums.append(float(num))
+    return float(np.mean(nums)) if nums else np.nan
+
+
+def _format_date_yyyy_mm_dd(series: pd.Series) -> pd.Series:
+    dates = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    return dates.dt.strftime("%Y-%m-%d").fillna("")
+
 res = st.session_state.get("results", None)
 
 if not isinstance(res, pd.DataFrame) or res.empty:
@@ -391,50 +434,51 @@ if not isinstance(res, pd.DataFrame) or res.empty:
     st.stop()
 
 # =========================
-# TABLEAU + SELECTION
+# TABLEAU ACTIVITÉS + SÉLECTION
 # =========================
-show = add_beneficiaire_column(res.copy())
+show_full = add_beneficiaire_column(res.copy())
 
-if "selected" not in show.columns:
-    show.insert(0, "selected", True)
+if "selected" not in show_full.columns:
+    show_full.insert(0, "selected", True)
+
+# Nettoyage des budgets dans la version métier conservée pour la suite.
+for c in ["budget_total", "budget_moyen_activite", "budget_activite"]:
+    if c in show_full.columns:
+        show_full[c] = to_int64_safe(show_full[c])
+
+# Copie strictement dédiée à l'affichage: on ne modifie pas les noms métiers
+# utilisés ensuite par la matrice, la frise et le payload LLM.
+show_display = show_full.copy()
+show_display = show_display.drop(
+    columns=["label_categorie_organisation", "bm25_score", "vec_score"],
+    errors="ignore",
+)
+show_display = show_display.rename(columns={"hybrid_score": "score de pertinence"})
 
 priority = ["selected", "objet_activite", "denomination", "beneficiaire"]
-rest = [c for c in show.columns if c not in priority]
-show = show.loc[:, [c for c in priority if c in show.columns] + rest]
-for c in ["budget_total", "budget_moyen_activite"]:
-    if c in show.columns:
-        show[c] = (
-            pd.to_numeric(show[c], errors="coerce")
-            .replace([np.inf, -np.inf], np.nan)  # ← neutralise les infinis
-            .round(0)
-            .astype("Int64")
-        )
+if "score de pertinence" in show_display.columns:
+    priority.append("score de pertinence")
+rest = [c for c in show_display.columns if c not in priority]
+show_display = show_display.loc[:, [c for c in priority if c in show_display.columns] + rest]
 
+if "date_publication_activite" in show_display.columns:
+    show_display["date_publication_activite"] = _format_date_yyyy_mm_dd(show_display["date_publication_activite"])
 
-
-st.markdown("### Résultats des activités de lobbying")
+st.markdown("### Activités de lobbying correspondant à la recherche")
 st.markdown("Tous les budgets sont exprimés en €")
 st.markdown("Désélectionnez les activités que vous considérez non pertinentes pour votre recherche, puis validez")
+st.caption("les activités de lobbying sont réalisées directement par l'organisation déclarante, ou par des cabinets de conseil ou d'avocats agissant pour le compte de l'organisation déclarante. Le bénéficiaire est l'entité qui bénéficie de l'activité de lobbying, et peut être différent de l'organisation déclarante: sociétés de conseil pour un client, groupe pour une filiale...Nous privilégions dans l'analyse les bénéficiaires plustôt que les déclarantes ("bénéficiaire" versus "dénommination") ")
 
-# formatage des dates
-if "date_publication_activite" in show.columns:
-    show["date_publication_activite"] = pd.to_datetime(
-        show["date_publication_activite"], errors="coerce"
-    )
-    
 edited = st.data_editor(
-    show,
+    show_display,
     use_container_width=True,
     column_config={
         "selected": st.column_config.CheckboxColumn("Sélection", default=True),
-        "date_publication_activite": st.column_config.DatetimeColumn(
-            "Date",
-            format="YYYY-MM-DD"
-        ),
     },
-    disabled=[c for c in show.columns if c != "selected"],
+    disabled=[c for c in show_display.columns if c != "selected"],
     key="results_editor",
 )
+st.caption("Le score de pertinence est un score hybride lexical et sémantique.")
 
 colv1, colv2 = st.columns([1, 4])
 with colv1:
@@ -443,8 +487,9 @@ with colv2:
     st.caption("La matrice, la frise chronologique et la synthèse des activités seront produites uniquement avec les lignes sélectionnées.")
 
 if validate:
+    selected_index = edited.index[edited["selected"] == True]
     st.session_state.selected_results = (
-        edited[edited["selected"] == True]
+        show_full.loc[selected_index]
         .drop(columns=["selected"], errors="ignore")
         .copy()
     )
@@ -453,118 +498,136 @@ if validate:
 selected_res = st.session_state.get("selected_results", None)
 if not isinstance(selected_res, pd.DataFrame) or selected_res.empty:
     # fallback : tout sélectionné tant qu'on n'a pas validé
-    selected_res = add_beneficiaire_column(res.copy())
+    selected_res = show_full.drop(columns=["selected"], errors="ignore").copy()
 
 # =========================
-# BUDGET ESTIMÉ SUR LA RECHERCHE (org) - SUR selected_res
+# TABLEAU ORGANISATIONS DÉCLARANTES
 # =========================
-st.markdown("#### Analyse du budget par organisation/bénéficiaire")
+st.markdown("#### Activités de lobbying par organisation déclarante")
 
 df_tmp = selected_res.copy()
-
-# 1. mapping bénéficiaire local (déjà existant)
-benef_local = build_beneficiaires_activites(df_tmp)
-
-# 2. stats globales (artefact construit dans build_artifacts)
-benef_stats = (
-    df_benef_global.groupby("beneficiaire")
-    .agg(
-        nb_activites_total_beneficiaire=("activite_id", "nunique"),
-        budget_total_beneficiaire=("budget_activite", "sum"),
-    )
-    .reset_index()
-)
-
-# 3. merge
-benef_search = benef_local.merge(
-    benef_stats,
-    left_on="beneficiaire_action_menee",
-    right_on="beneficiaire",
-    how="left"
-)
-
-# 4. nettoyage
-benef_search["budget_total_beneficiaire"] = to_int64_safe(
-    benef_search["budget_total_beneficiaire"]
-)
-
-benef_search["nb_activites_total_beneficiaire"] = to_int64_safe(
-    benef_search["nb_activites_total_beneficiaire"]
-)
-
-# 5. affichage
-st.dataframe(benef_search, use_container_width=True)
-
-
 if "activite_id" not in df_tmp.columns:
     df_tmp = df_tmp.reset_index().rename(columns={"index": "activite_id"})
 if "activite_id" not in df_tmp.columns:
     df_tmp["activite_id"] = df_tmp.index.astype(str)
+df_tmp["activite_id"] = _norm_id_series(df_tmp["activite_id"])
 
-agg_benef = {
-    "denomination": ("denomination", lambda s: _join_unique(s, max_items=50)),
+budget_col = _activity_budget_column(df_tmp)
+df_tmp[budget_col] = pd.to_numeric(df_tmp.get(budget_col, 0), errors="coerce").fillna(0)
+
+agg_org = {
     "nb_activites_matching": ("activite_id", "nunique"),
-    "budget_moyen_activite": ("budget_moyen_activite", "mean"),
+    "budget_estime_recherche": (budget_col, "sum"),
 }
-
 if "label_categorie_organisation" in df_tmp.columns:
-    agg_benef["label_categorie_organisation"] = (
-        "label_categorie_organisation",
-        lambda s: _join_unique(s, max_items=20),
-    )
+    agg_org["categorie"] = ("label_categorie_organisation", lambda s: _join_unique(s, max_items=20))
+if "nb_activites_total" in df_tmp.columns:
+    agg_org["nb_activites_total"] = ("nb_activites_total", "max")
+if "budget_total" in df_tmp.columns:
+    agg_org["budget_total"] = ("budget_total", "max")
+if "nombre_salaries" in df_tmp.columns:
+    agg_org["nombre_salaries"] = ("nombre_salaries", _mean_distinct_numeric)
 
-benef_search = (
-    df_tmp.groupby("beneficiaire", dropna=False)
-    .agg(**agg_benef)
+org_search = (
+    df_tmp.groupby("denomination", dropna=False)
+    .agg(**agg_org)
     .reset_index()
 )
 
-benef_search["budget_estime_recherche"] = (
-    pd.to_numeric(benef_search["budget_moyen_activite"], errors="coerce").fillna(0)
-    * pd.to_numeric(benef_search["nb_activites_matching"], errors="coerce").fillna(0)
-)
-
-benef_stats = build_beneficiaire_stats(df_benef_global)
-
-benef_search = benef_search.merge(
-    benef_stats,
-    on="beneficiaire",
-    how="left",
-)
+if "representants_id" in df_tmp.columns:
+    org_for_affiliations = (
+        df_tmp[["denomination", "representants_id"]]
+        .dropna(subset=["denomination"])
+        .drop_duplicates()
+    )
+    affiliations_par_org = build_affiliations_organisations(org_for_affiliations)
+    if not affiliations_par_org.empty:
+        org_search = org_search.merge(affiliations_par_org, on="denomination", how="left")
 
 for col in [
     "nb_activites_matching",
-    "budget_moyen_activite",
     "budget_estime_recherche",
-    "nb_activites_total_beneficiaire",
+    "nb_activites_total",
+    "budget_total",
+    "nombre_salaries",
+    "nb_affiliations",
+]:
+    if col in org_search.columns:
+        org_search[col] = to_int64_safe(org_search[col])
+
+org_cols = [
+    "denomination",
+    "categorie",
+    "nb_activites_matching",
+    "budget_estime_recherche",
+    "budget_total",
+    "nb_activites_total",
+    "nombre_salaries",
+    "nb_affiliations",
+    "denomination_affiliation",
+]
+org_search = org_search[[c for c in org_cols if c in org_search.columns]]
+org_search = org_search.sort_values("budget_estime_recherche", ascending=False)
+st.dataframe(org_search, use_container_width=True)
+
+# =========================
+# TABLEAU BÉNÉFICIAIRES
+# =========================
+st.markdown("#### Activités de lobbying par bénéficiaire")
+
+benef_global = df_benef_global.copy()
+if "activite_id" in benef_global.columns:
+    benef_global["activite_id"] = _norm_id_series(benef_global["activite_id"])
+if "budget_activite" in benef_global.columns:
+    benef_global["budget_activite"] = pd.to_numeric(benef_global["budget_activite"], errors="coerce").fillna(0)
+
+selected_ids = set(df_tmp["activite_id"].dropna().astype(str))
+benef_selected = benef_global[benef_global["activite_id"].astype(str).isin(selected_ids)].copy() if "activite_id" in benef_global.columns else pd.DataFrame()
+
+if not benef_selected.empty and {"beneficiaire", "activite_id", "budget_activite"}.issubset(benef_selected.columns):
+    benef_search = (
+        benef_selected.groupby("beneficiaire", dropna=False)
+        .agg(
+            nb_activites_matching=("activite_id", "nunique"),
+            budget_estime_recherche=("budget_activite", "sum"),
+        )
+        .reset_index()
+    )
+else:
+    fallback = df_tmp.copy()
+    benef_col = "beneficiaire" if "beneficiaire" in fallback.columns else "denomination"
+    benef_search = (
+        fallback.groupby(benef_col, dropna=False)
+        .agg(
+            nb_activites_matching=("activite_id", "nunique"),
+            budget_estime_recherche=(budget_col, "sum"),
+        )
+        .reset_index()
+        .rename(columns={benef_col: "beneficiaire"})
+    )
+
+benef_stats = build_beneficiaire_stats(benef_global)
+benef_search = benef_search.merge(benef_stats, on="beneficiaire", how="left")
+
+for col in [
+    "nb_activites_matching",
+    "budget_estime_recherche",
     "budget_total_beneficiaire",
+    "nb_activites_total_beneficiaire",
 ]:
     if col in benef_search.columns:
         benef_search[col] = to_int64_safe(benef_search[col])
 
-priority_benef_cols = [
+benef_cols = [
     "beneficiaire",
-    "denomination",
-    "label_categorie_organisation",
     "nb_activites_matching",
     "budget_estime_recherche",
-    "budget_moyen_activite",
     "budget_total_beneficiaire",
     "nb_activites_total_beneficiaire",
 ]
-
-benef_search = benef_search[
-    [c for c in priority_benef_cols if c in benef_search.columns]
-    + [c for c in benef_search.columns if c not in priority_benef_cols]
-]
-
+benef_search = benef_search[[c for c in benef_cols if c in benef_search.columns]]
 benef_search = benef_search.sort_values("budget_estime_recherche", ascending=False)
-
-with st.expander(
-    "Pour chaque bénéficiaire: nombre d'activités et budget correspondant à la recherche, et budget global estimé",
-    expanded=False,
-):
-    st.dataframe(benef_search, use_container_width=True)
+st.dataframe(benef_search, use_container_width=True)
 
 # =========================
 # MATRICE BULLES org x domaines - SUR selected_res
@@ -704,33 +767,6 @@ else:
     )
 
 # =========================
-# BENEFICIAIRES ET AFFILIATIONS
-# =========================
-
-beneficiaires_par_activite = build_beneficiaires_activites(selected_res)
-
-org_for_affiliations = selected_res.copy()
-
-if "representants_id" in org_for_affiliations.columns:
-    org_for_affiliations = (
-        org_for_affiliations[
-            ["denomination", "representants_id"]
-        ]
-        .dropna(subset=["denomination"])
-        .drop_duplicates()
-    )
-
-    affiliations_par_org = build_affiliations_organisations(org_for_affiliations)
-else:
-    affiliations_par_org = pd.DataFrame()
-
-st.markdown("### Affiliations des organisations")
-if affiliations_par_org.empty:
-    st.info("Aucune affiliation trouvée pour les organisations de la recherche.")
-else:
-    st.dataframe(affiliations_par_org, use_container_width=True)
-
-# =========================
 # LOIS CORRESPONDANT A LA RECHERCHE
 # =========================
 
@@ -795,20 +831,15 @@ if "selected" not in show_laws.columns:
 st.markdown("#### Lois correspondant à la recherche")
 st.markdown("Désélectionnez les lois non pertinentes, puis validez")
 
-if "date_publication_activite" in show.columns:
-    show["date_publication_activite"] = pd.to_datetime(
-        show["date_publication_activite"], errors="coerce"
-    )
+for date_col in ["Date initiale", "Date de promulgation", "date_evt", "date_publication_activite"]:
+    if date_col in show_laws.columns:
+        show_laws[date_col] = _format_date_yyyy_mm_dd(show_laws[date_col])
 
 edited_laws = st.data_editor(
     show_laws,
     use_container_width=True,
     column_config={
         "selected": st.column_config.CheckboxColumn("Sélection", default=True),
-        "date_publication_activite": st.column_config.DatetimeColumn(
-            "Date",
-            format="YYYY-MM-DD"
-        ),
     },
     disabled=[c for c in show_laws.columns if c != "selected"],
     key="laws_editor",
