@@ -33,6 +33,9 @@ except ImportError:
     SentenceTransformer = None
 
 
+st.set_page_config(page_title="Cartographie des influences", layout="wide")
+
+
 def load_parquet_or_raw(parquet_name: str, raw_name: str) -> pd.DataFrame:
     try:
         df = load_parquet(parquet_name)
@@ -200,7 +203,6 @@ def stable_jitter(value: str, scale: float = 0.25) -> float:
 
 
 # application Streamlit
-st.set_page_config(page_title="Cartographie des influences", layout="wide")
 st.title("Cartographie des influences")
 
 

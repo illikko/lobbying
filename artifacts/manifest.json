@@ -1,0 +1,31 @@
+{
+  "built_at": "2026-05-07T19:03:16.290823Z",
+  "config": {
+    "st_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "nlist": 2048,
+    "m": 32,
+    "nbits": 8,
+    "normalize": true,
+    "created_by": "build_artifacts.py"
+  },
+  "counts": {
+    "activites": 111322,
+    "lois": 2239,
+    "docs_activites": 111322,
+    "affiliations": 7450,
+    "beneficiaires": 248362,
+    "observations": 111332
+  },
+  "files": {
+    "df_activites_min": "df_activites_min.parquet",
+    "df_lois_min": "df_lois_min.parquet",
+    "docs_activites": "docs_activites.parquet",
+    "bm25_activites": "bm25_activites.joblib",
+    "faiss_activites": "faiss_activites.index",
+    "id_map_activites": "id_map_activites.parquet",
+    "df_affiliations": "df_affiliations.parquet",
+    "df_beneficiaires": "df_beneficiaires.parquet",
+    "df_observations": "df_observations.parquet",
+    "df_beneficiaires_activites_globales": "df_beneficiaires_activites_globales.parquet"
+  }
+}
