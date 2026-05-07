@@ -17,12 +17,11 @@ from src.activity_analytics import (
     ensure_activite_id,
     explode_beneficiary_domains,
     join_unique,
-    mean_distinct_numeric,
     norm_id_series,
     to_int64_safe,
 )
 from src.config import ART
-from src.embed_index import FaissBundle, faiss_search
+from src.embed_index import FaissBundle
 from src.io_artifacts import load_joblib, load_parquet, load_faiss, read_manifest
 from src.llm_summarize import summarize_activites
 from src.search_backend import configured_search_backend, hybrid_or_bm25_search_activites
@@ -32,10 +31,6 @@ try:
     from sentence_transformers import SentenceTransformer
 except ImportError:
     SentenceTransformer = None
-
-
-st.set_page_config(page_title="Cartographie des influences", layout="wide")
-st.title("Cartographie des influences")
 
 
 def load_parquet_or_raw(parquet_name: str, raw_name: str) -> pd.DataFrame:
@@ -51,108 +46,62 @@ def load_parquet_or_raw(parquet_name: str, raw_name: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-@st.cache_resource(show_spinner="Chargement des artefacts…")
-def load_all():
-    manifest = read_manifest()
-    df_acts = load_parquet(ART.df_activites_min)
-    df_lois = load_parquet(ART.df_lois_min)
-    bm25_bundle = load_joblib(ART.bm25_activites)
-    bm25_lois_bundle = load_joblib(ART.bm25_lois)
-
-    faiss_bundle = None
-    faiss_lois_bundle = None
-    try:
-        faiss_index = load_faiss(ART.faiss_activites)
-        id_map = load_parquet(ART.id_map_activites)
-        faiss_bundle = FaissBundle(
-            index=faiss_index,
-            doc_ids=id_map["activite_id"].astype(object).to_numpy(),
-            normalize=True,
-        )
-    except (FileNotFoundError, ImportError):
-        faiss_bundle = None
-
-    try:
-        faiss_lois_index = load_faiss(ART.faiss_lois)
-        id_map_lois = load_parquet(ART.id_map_lois)
-        faiss_lois_bundle = FaissBundle(
-            index=faiss_lois_index,
-            doc_ids=id_map_lois["loi_id"].astype(object).to_numpy(),
-            normalize=True,
-        )
-    except (FileNotFoundError, ImportError):
-        faiss_lois_bundle = None
-
-    search_backend = configured_search_backend()
-    embedder = None
-    if search_backend != "bm25" and faiss_bundle is not None and SentenceTransformer is not None:
-        st_model = (manifest.get("config", {}) or {}).get(
-            "st_model",
-            "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        )
-        embedder = SentenceTransformer(st_model)
-
-    return {
-        "manifest": manifest,
-        "df_acts": df_acts,
-        "df_lois": df_lois,
-        "bm25_bundle": bm25_bundle,
-        "bm25_lois_bundle": bm25_lois_bundle,
-        "faiss_bundle": faiss_bundle,
-        "faiss_lois_bundle": faiss_lois_bundle,
-        "embedder": embedder,
-        "df_affiliations": load_parquet_or_raw("df_affiliations.parquet", "5_affiliations.xlsx"),
-        "df_beneficiaires": load_parquet_or_raw("df_beneficiaires.parquet", "11_beneficiaires.xlsx"),
-        "df_observations": load_parquet_or_raw("df_observations.parquet", "14_observations.xlsx"),
-    }
+def explode_ids(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    out = df.copy()
+    out[col] = norm_id_series(out[col])
+    out[col] = out[col].str.split(r"\s*[;,|]\s*", regex=True)
+    out = out.explode(col)
+    out[col] = norm_id_series(out[col])
+    return out.dropna(subset=[col])
 
 
-STATE = load_all()
-df_acts = STATE["df_acts"]
-df_lois = STATE["df_lois"]
-bm25_bundle = STATE["bm25_bundle"]
-bm25_lois_bundle = STATE["bm25_lois_bundle"]
-faiss_bundle = STATE["faiss_bundle"]
-faiss_lois_bundle = STATE["faiss_lois_bundle"]
-embedder = STATE["embedder"]
-df_affiliations = STATE["df_affiliations"]
-df_beneficiaires = STATE["df_beneficiaires"]
-df_observations = STATE["df_observations"]
+def fill_missing_category_from_infos(df_acts: pd.DataFrame, df_infos: pd.DataFrame) -> pd.DataFrame:
+    if df_acts.empty or df_infos.empty:
+        return df_acts
+    if "representants_id" not in df_acts.columns:
+        return df_acts
+    if not {"representants_id", "label_categorie_organisation"}.issubset(df_infos.columns):
+        return df_acts
 
-if "results" not in st.session_state:
-    st.session_state.results = None
+    out = df_acts.copy()
+    if "label_categorie_organisation" in out.columns:
+        missing_mask = out["label_categorie_organisation"].isna() | (out["label_categorie_organisation"].astype("string").str.strip() == "")
+    else:
+        out["label_categorie_organisation"] = pd.NA
+        missing_mask = pd.Series(True, index=out.index)
+
+    left = explode_ids(out.loc[missing_mask, ["activite_id", "representants_id"]].drop_duplicates(), "representants_id")
+    right = explode_ids(df_infos[["representants_id", "label_categorie_organisation"]].copy(), "representants_id")
+    right["label_categorie_organisation"] = right["label_categorie_organisation"].astype("string").str.strip()
+    right = right.dropna(subset=["representants_id", "label_categorie_organisation"]).drop_duplicates()
+    if left.empty or right.empty:
+        return out
+
+    mapped = left.merge(right, on="representants_id", how="left")
+    categories = (
+        mapped.groupby("activite_id", dropna=False)["label_categorie_organisation"]
+        .agg(lambda s: join_unique(s, max_items=10))
+        .replace("", pd.NA)
+    )
+    out.loc[missing_mask, "label_categorie_organisation"] = out.loc[missing_mask, "activite_id"].astype(str).map(categories)
+    return out
 
 
-def embed_query_fn(q: str) -> np.ndarray:
-    if embedder is None:
-        raise RuntimeError("Embedder indisponible.")
-    vector = embedder.encode([str(q or "")], convert_to_numpy=True)[0]
-    return vector.astype("float32", copy=False)
-
-
-def build_affiliations_organisations(org_search: pd.DataFrame) -> pd.DataFrame:
-    if org_search is None or org_search.empty:
+def build_affiliations_by_org(selected_activities: pd.DataFrame, df_affiliations: pd.DataFrame) -> pd.DataFrame:
+    if selected_activities.empty or df_affiliations.empty:
         return pd.DataFrame()
-    if "representants_id" not in org_search.columns:
+    if "representants_id" not in selected_activities.columns:
         return pd.DataFrame()
-    required = {"representants_id", "denomination_affiliation"}
-    if df_affiliations.empty or not required.issubset(df_affiliations.columns):
+    if not {"representants_id", "denomination_affiliation"}.issubset(df_affiliations.columns):
         return pd.DataFrame()
 
-    left = org_search[["denomination", "representants_id"]].drop_duplicates().copy()
-    left["representants_id"] = norm_id_series(left["representants_id"])
-    left["representants_id"] = left["representants_id"].str.split(r"\s*[;,|]\s*", regex=True)
-    left = left.explode("representants_id").dropna(subset=["representants_id"])
-
-    right = df_affiliations[["representants_id", "denomination_affiliation"]].copy()
-    right["representants_id"] = norm_id_series(right["representants_id"])
+    left = explode_ids(selected_activities[["denomination", "representants_id"]].dropna(subset=["denomination"]).drop_duplicates(), "representants_id")
+    right = explode_ids(df_affiliations[["representants_id", "denomination_affiliation"]].copy(), "representants_id")
     right["denomination_affiliation"] = right["denomination_affiliation"].astype("string").str.strip()
     right = right.dropna(subset=["representants_id", "denomination_affiliation"]).drop_duplicates()
-
     detail = left.merge(right, on="representants_id", how="inner")
     if detail.empty:
         return pd.DataFrame()
-
     return (
         detail.groupby("denomination", dropna=False)
         .agg(
@@ -168,44 +117,120 @@ def format_date_yyyy_mm_dd(series: pd.Series) -> pd.Series:
     return dates.dt.strftime("%Y-%m-%d").fillna("")
 
 
-def search_lois(query_text: str, topn_laws: int, search_backend: str) -> pd.DataFrame:
+@st.cache_resource(show_spinner="Chargement des artefacts…")
+def load_all():
+    manifest = read_manifest()
+    df_acts = ensure_activite_id(load_parquet(ART.df_activites_min))
+    df_lois = load_parquet(ART.df_lois_min)
+    df_infos = load_parquet_or_raw("df_informations_generales.parquet", "1_informations_generales.xlsx")
+    df_acts = fill_missing_category_from_infos(df_acts, df_infos)
+    df_acts.index = df_acts["activite_id"].astype(str)
+
+    bm25_bundle = load_joblib(ART.bm25_activites)
+    bm25_lois_bundle = load_joblib(ART.bm25_lois)
+
+    faiss_bundle = None
+    try:
+        faiss_index = load_faiss(ART.faiss_activites)
+        id_map = load_parquet(ART.id_map_activites)
+        faiss_bundle = FaissBundle(index=faiss_index, doc_ids=id_map["activite_id"].astype(object).to_numpy(), normalize=True)
+    except (FileNotFoundError, ImportError):
+        faiss_bundle = None
+
+    search_backend = configured_search_backend()
+    embedder = None
+    if search_backend != "bm25" and faiss_bundle is not None and SentenceTransformer is not None:
+        st_model = (manifest.get("config", {}) or {}).get(
+            "st_model",
+            "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        )
+        embedder = SentenceTransformer(st_model)
+
+    return {
+        "df_acts": df_acts,
+        "df_lois": df_lois,
+        "bm25_bundle": bm25_bundle,
+        "bm25_lois_bundle": bm25_lois_bundle,
+        "faiss_bundle": faiss_bundle,
+        "embedder": embedder,
+        "df_affiliations": load_parquet_or_raw("df_affiliations.parquet", "5_affiliations.xlsx"),
+        "df_beneficiaires": load_parquet_or_raw("df_beneficiaires.parquet", "11_beneficiaires.xlsx"),
+        "df_observations": load_parquet_or_raw("df_observations.parquet", "14_observations.xlsx"),
+    }
+
+
+STATE = load_all()
+df_acts = STATE["df_acts"]
+df_lois = STATE["df_lois"]
+bm25_bundle = STATE["bm25_bundle"]
+bm25_lois_bundle = STATE["bm25_lois_bundle"]
+faiss_bundle = STATE["faiss_bundle"]
+embedder = STATE["embedder"]
+df_affiliations = STATE["df_affiliations"]
+df_beneficiaires = STATE["df_beneficiaires"]
+df_observations = STATE["df_observations"]
+
+
+def embed_query_fn(q: str) -> np.ndarray:
+    if embedder is None:
+        raise RuntimeError("Embedder indisponible.")
+    vector = embedder.encode([str(q or "")], convert_to_numpy=True)[0]
+    return vector.astype("float32", copy=False)
+
+
+def search_lois(query_text: str, topn_laws: int) -> pd.DataFrame:
     qtok = tokenize(query_text)
     if not qtok:
         return df_lois.iloc[0:0].copy()
-
-    scores_bm = np.asarray(bm25_lois_bundle.bm25.get_scores(qtok), dtype=float)
-    idx_bm = np.argsort(scores_bm)[::-1][: max(topn_laws, 50)]
-    bm_ids = bm25_lois_bundle.doc_ids[idx_bm].astype(object)
-    bm_scores = scores_bm[idx_bm]
-
-    laws_df = df_lois.copy().reset_index(drop=True)
-    laws_df.index = laws_df.index.astype(str)
-    laws = laws_df.loc[laws_df.index.intersection(pd.Index(bm_ids.astype(str)))].copy()
-    if laws.empty:
-        return laws
-
-    bm_map = {str(i): float(s) for i, s in zip(bm_ids, bm_scores)}
-    laws["bm25_score"] = laws.index.map(lambda x: bm_map.get(str(x), 0.0)).astype(float)
-    laws["vec_score"] = 0.0
-    laws["hybrid_score"] = laws["bm25_score"]
-
-    if search_backend != "bm25" and faiss_lois_bundle is not None and embedder is not None:
-        qvec = embed_query_fn(query_text)
-        vec_ids, vec_scores = faiss_search(faiss_lois_bundle, qvec, topk=max(topn_laws, 50), nprobe=16)
-        vec_map = {str(i): float(s) for i, s in zip(vec_ids, vec_scores)}
-        laws["vec_score"] = laws.index.map(lambda x: vec_map.get(str(x), 0.0)).astype(float)
-        laws["hybrid_score"] = laws["bm25_score"] + laws["vec_score"]
-
-    return laws.sort_values("hybrid_score", ascending=False).head(int(topn_laws))
+    scores = np.asarray(bm25_lois_bundle.bm25.get_scores(qtok), dtype=float)
+    idx = np.argsort(scores)[::-1][: int(topn_laws)]
+    out = df_lois.iloc[idx].copy()
+    out["bm25_score"] = scores[idx]
+    return out.sort_values("bm25_score", ascending=False)
 
 
-with st.expander("À propos", expanded=False):
-    st.markdown(
-        """
-        Recherche d'activités de lobbying avec tables analytiques cohérentes.
-        Les bénéficiaires sont rattachés uniquement via `activite_id -> observations -> bénéficiaires`.
-        """
-    )
+def first_theme(value) -> str:
+    parts = [p.strip() for p in re.split(r"[;,/|]", str(value or "")) if p.strip()]
+    return parts[0] if parts else "Thème inconnu"
+
+
+def stable_jitter(value: str, scale: float = 0.25) -> float:
+    hashed = zlib.crc32(value.encode("utf-8")) % 10000
+    return (hashed / 10000 - 0.5) * 2 * scale
+
+
+# application Streamlit
+st.set_page_config(page_title="Cartographie des influences", layout="wide")
+st.title("Cartographie des influences")
+
+
+with st.expander("ℹ️ À propos de l'application", expanded=False):
+        st.markdown("""
+        Cette application permet de cartographier les activités de lobbying en France.  
+        Elle utilise une recherche hybride lexicale et sémantique pour trouver les activités les plus pertinentes par rapport à une requête comprenant plusieurs mots clé ou une/plusieurs phrases.  
+        &nbsp;&nbsp;&nbsp;&nbsp; par exemple: transport, fret, fiscalité  
+
+        Les résultats de la recherche sont présentés sous forme de:  
+        • tableau avec des filtres interactifs  
+        • matrice à bulles représentant les organisations et les domaines d'activité  
+        • frise chronoligique des activités de lobbying et des lois  
+        • synthèse par IA des activités de lobbying  
+        
+        Elle utilise les données ouvertes de la HATPV sur les activités de lobbying (environ 100K activités) et les lois du Sénat (envrion 6000 lois).
+
+        L'application est à un stade d'expérimentation, et évolue en fonction des retours de ses utilisateurs.
+        Elle est développée par Vincent Castaignet, un data analyst/scientist freelance.
+        """)
+
+with st.expander("ℹ️ Comment ça marche ?", expanded=False):
+        st.markdown("""
+        • écrire les mots clés recherchés ou les phrases dans le formulaire "mots-clés / requête", puis cliquer sur "Lancer" pour obtenir les résultats de recherche  
+        • lire les résultats (objet_activite), et dé-sélectionner les activités qui ne sont pas pertinentes (colonne "Sélection"), puis cliquer sur "Valider la sélection" pour confirmer les activités retenues  
+        • faire de même pour les lois correspondant à la recherche (dé-sélectionner les lois non pertinentes, puis valider)  
+        • explorer les différentes visualisations (matrice à bulles, frise chronologique)  
+        • dans l'onglet "Synthèse", cliquer sur "Générer la synthèse" pour obtenir une synthèse textuelle des activités de lobbying retenues, par un modèle de langage (LLM)  
+        • utiliser les filtres pour ajuster la recherche: nombre de résultats demandés, budget, période  
+        """)
 
 years = pd.to_datetime(df_acts["date_publication_activite"], errors="coerce").dropna().dt.year
 y_min = int(years.min()) if not years.empty else 2018
@@ -222,7 +247,7 @@ with c3:
 
 search_backend = configured_search_backend()
 effective_search_backend = "hybrid" if search_backend != "bm25" and faiss_bundle is not None and embedder is not None else "bm25"
-st.caption(f"Backend activites: `{effective_search_backend}`")
+st.caption(f"Backend activités: `{effective_search_backend}`")
 
 if st.button("Lancer", type="primary"):
     with st.spinner("Recherche…"):
@@ -257,20 +282,34 @@ analytics_for_results = build_search_analytics(
     df_observations=df_observations,
     df_beneficiaires=df_beneficiaires,
 )
-activities_display = analytics_for_results.table_activites.copy()
-activities_display.insert(0, "selected", True)
-activities_display = activities_display.rename(
+activities_display = analytics_for_results.table_activites.copy().rename(
     columns={
         "beneficiaires": "beneficiaire(s)",
         "hybrid_score": "score de pertinence",
         "budget_utilise": "budget utilisé",
     }
 )
+activities_display.insert(0, "selected", True)
 if "date_publication_activite" in activities_display.columns:
     activities_display["date_publication_activite"] = format_date_yyyy_mm_dd(activities_display["date_publication_activite"])
-for col in ["budget utilisé", "score de pertinence", "nb_beneficiaires"]:
-    if col in activities_display.columns:
-        activities_display[col] = activities_display[col]
+if "budget utilisé" in activities_display.columns:
+    activities_display["budget utilisé"] = to_int64_safe(activities_display["budget utilisé"])
+drop_cols = [c for c in ["bm25_score", "vec_score", "hybrid_score"] if c in activities_display.columns]
+if drop_cols:
+    activities_display = activities_display.drop(columns=drop_cols)
+activity_column_order = [
+    "selected",
+    "activite_id",
+    "objet_activite",
+    "denomination",
+    "beneficiaire(s)",
+    "nb_beneficiaires",
+    "date_publication_activite",
+    "budget utilisé",
+    "domaines",
+    "score de pertinence",
+]
+activities_display = activities_display[[c for c in activity_column_order if c in activities_display.columns]]
 
 st.markdown("### Table Activités")
 edited = st.data_editor(
@@ -290,31 +329,13 @@ selected_res = st.session_state.get("selected_results")
 if not isinstance(selected_res, pd.DataFrame) or selected_res.empty:
     selected_res = res.copy()
 
-affiliations_by_org = build_affiliations_organisations(
-    selected_res[["denomination", "representants_id"]].drop_duplicates()
-    if {"denomination", "representants_id"}.issubset(selected_res.columns)
-    else pd.DataFrame()
-)
+affiliations_by_org = build_affiliations_by_org(selected_res, df_affiliations)
 analytics = build_search_analytics(
     selected_activities=selected_res,
     df_observations=df_observations,
     df_beneficiaires=df_beneficiaires,
     affiliations_by_org=affiliations_by_org,
 )
-
-table_activites = analytics.table_activites.copy().rename(
-    columns={
-        "beneficiaires": "beneficiaire(s)",
-        "budget_utilise": "budget utilisé",
-        "hybrid_score": "score de pertinence",
-    }
-)
-if "date_publication_activite" in table_activites.columns:
-    table_activites["date_publication_activite"] = format_date_yyyy_mm_dd(table_activites["date_publication_activite"])
-if "budget utilisé" in table_activites.columns:
-    table_activites["budget utilisé"] = to_int64_safe(table_activites["budget utilisé"])
-
-st.dataframe(table_activites, use_container_width=True)
 
 st.markdown("### Table Organisations déclarantes")
 st.dataframe(analytics.table_organisations, use_container_width=True)
@@ -341,13 +362,12 @@ else:
         st.info("Aucune cellule de matrice avec budget réparti.")
     else:
         top_domains = (
-            cell.groupby("domaine")["budget_estime_recherche"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(12)
-            .index
+            cell.groupby("domaine")["budget_estime_recherche"].sum().sort_values(ascending=False).head(12).index
         )
         cell = cell[cell["domaine"].isin(top_domains)].copy()
+        top_beneficiaries = (
+            cell.groupby("beneficiaire")["budget_estime_recherche"].sum().sort_values(ascending=False).index.tolist()
+        )
         cell["hover"] = (
             "<b>Bénéficiaire :</b> " + cell["beneficiaire"].astype(str)
             + "<br><b>Domaine :</b> " + cell["domaine"].astype(str)
@@ -363,33 +383,42 @@ else:
                 x=cell["domaine"].astype(str),
                 y=cell["beneficiaire"].astype(str),
                 mode="markers",
-                marker=dict(
-                    size=cell["budget_estime_recherche"],
-                    sizemode="area",
-                    sizeref=sizeref,
-                    sizemin=3,
-                    opacity=0.75,
-                ),
+                marker=dict(size=cell["budget_estime_recherche"], sizemode="area", sizeref=sizeref, sizemin=3, opacity=0.75),
                 text=cell["hover"],
                 hovertemplate="%{text}<extra></extra>",
             )
         )
+        figm.update_xaxes(categoryorder="array", categoryarray=list(top_domains))
+        figm.update_yaxes(categoryorder="array", categoryarray=top_beneficiaries, autorange="reversed")
         figm.update_layout(height=max(650, 28 * cell["beneficiaire"].nunique() + 200))
         st.plotly_chart(figm, use_container_width=True)
 
 st.markdown("### Lois correspondant à la recherche")
 topn_laws = st.slider("Nombre de lois", 5, 200, 20, 5)
-lois_res = search_lois(st.session_state.get("last_query", ""), int(topn_laws), effective_search_backend)
+lois_res = search_lois(st.session_state.get("last_query", ""), int(topn_laws))
 show_laws = lois_res.copy()
 if not show_laws.empty:
     show_laws.insert(0, "selected", True)
     for date_col in ["Date initiale", "Date de promulgation"]:
         if date_col in show_laws.columns:
             show_laws[date_col] = format_date_yyyy_mm_dd(show_laws[date_col])
+    laws_display = show_laws.rename(columns={"bm25_score": "score de pertinence"})
+    law_column_order = [
+        "selected",
+        "Titre",
+        "Numéro de la loi",
+        "Thèmes",
+        "Date initiale",
+        "Date de promulgation",
+        "État du dossier",
+        "URL du dossier",
+        "score de pertinence",
+    ]
+    laws_display = laws_display[[c for c in law_column_order if c in laws_display.columns]]
     edited_laws = st.data_editor(
-        show_laws,
+        laws_display,
         use_container_width=True,
-        disabled=[c for c in show_laws.columns if c != "selected"],
+        disabled=[c for c in laws_display.columns if c != "selected"],
         column_config={"selected": st.column_config.CheckboxColumn("Sélection", default=True)},
         key="laws_editor",
     )
@@ -397,17 +426,6 @@ if not show_laws.empty:
 else:
     selected_lois = pd.DataFrame()
     st.info("Aucune loi trouvée.")
-
-
-def first_theme(value) -> str:
-    parts = [p.strip() for p in re.split(r"[;,/|]", str(value or "")) if p.strip()]
-    return parts[0] if parts else "Thème inconnu"
-
-
-def stable_jitter(value: str, scale: float = 0.25) -> float:
-    hashed = zlib.crc32(value.encode("utf-8")) % 10000
-    return (hashed / 10000 - 0.5) * 2 * scale
-
 
 st.markdown("### Chronologie activités & lois")
 acts = analytics.table_activites.copy()
@@ -461,7 +479,8 @@ st.plotly_chart(figt, use_container_width=True)
 
 st.markdown("### Synthèse des résultats")
 payload_llm = build_llm_payload(st.session_state.get("last_query", ""), analytics)
-st.json(payload_llm, expanded=False)
+with st.expander("Payload LLM", expanded=False):
+    st.json(payload_llm, expanded=False)
 if st.button("Générer la synthèse (par LLM)", type="primary"):
     with st.spinner("Synthèse…"):
         st.session_state.synth = summarize_activites(payload_llm)

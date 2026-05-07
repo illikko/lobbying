@@ -298,6 +298,26 @@ class AnalyticsBundle:
     table_organisations: pd.DataFrame
     table_beneficiaires: pd.DataFrame
     matrix_beneficiaires_domaines: pd.DataFrame
+    table_domaines: pd.DataFrame
+
+
+def build_domain_table(enriched: pd.DataFrame) -> pd.DataFrame:
+    detail = explode_beneficiary_domains(enriched)
+    if detail.empty:
+        return pd.DataFrame(columns=["domaine", "budget_estime_recherche", "nb_beneficiaires", "nb_activites_matching"])
+    out = (
+        detail.groupby("domaine", dropna=False)
+        .agg(
+            budget_estime_recherche=("budget_beneficiaire_domaine", "sum"),
+            nb_beneficiaires=("beneficiaire", "nunique"),
+            nb_activites_matching=("activite_id", "nunique"),
+        )
+        .reset_index()
+    )
+    out["budget_estime_recherche"] = to_int64_safe(out["budget_estime_recherche"])
+    out["nb_beneficiaires"] = to_int64_safe(out["nb_beneficiaires"])
+    out["nb_activites_matching"] = to_int64_safe(out["nb_activites_matching"])
+    return out.sort_values("budget_estime_recherche", ascending=False)
 
 
 def build_search_analytics(
@@ -317,6 +337,7 @@ def build_search_analytics(
         table_organisations=build_organisation_table(enriched, affiliations_by_org=affiliations_by_org),
         table_beneficiaires=build_beneficiaire_table(enriched),
         matrix_beneficiaires_domaines=build_beneficiary_domain_matrix(enriched),
+        table_domaines=build_domain_table(enriched),
     )
 
 
@@ -339,16 +360,19 @@ def build_llm_payload(
         "budget_utilise",
         "hybrid_score",
     ] if c in analytics.table_activites.columns]
+    activites_selectionnees = analytics.table_activites[activity_cols].to_dict(orient="records")
     return {
         "contexte": {
             "requete": requete,
             "nb_activites_retenues": int(analytics.table_activites["activite_id"].nunique()) if not analytics.table_activites.empty else 0,
             "budget_total_estime_recherche": budget_total,
         },
-        "tableau_activites": analytics.table_activites[activity_cols].to_dict(orient="records"),
+        "tableau_activites": activites_selectionnees,
         "tableau_organisations": analytics.table_organisations.to_dict(orient="records"),
         "tableau_beneficiaires": analytics.table_beneficiaires.to_dict(orient="records"),
         "tableau_beneficiaires_domaines": analytics.matrix_beneficiaires_domaines.to_dict(orient="records"),
+        "tableau_domaines": analytics.table_domaines.to_dict(orient="records"),
+        "activites_selectionnees": activites_selectionnees,
     }
 
 
