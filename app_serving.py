@@ -14,34 +14,6 @@ import plotly.express as px
 from rank_bm25 import BM25Okapi
 from src.textnorm import tokenize
 from sentence_transformers import SentenceTransformer
-from pathlib import Path
-
-
-def load_parquet_optional(name: str) -> pd.DataFrame:
-    """Charge un parquet d'artefact si présent, sinon retourne un DataFrame vide.
-
-    Permet à l'app de rester compatible avec les artefacts Render existants
-    quand les petits artefacts auxiliaires n'ont pas encore été générés.
-    """
-    try:
-        return load_parquet(name)
-    except FileNotFoundError:
-        return pd.DataFrame()
-
-
-def load_raw_xlsx_optional(filename: str, columns: list[str] | None = None) -> pd.DataFrame:
-    """Fallback léger depuis data/raw, sans FAISS ni rebuild complet."""
-    path = Path("data/raw") / filename
-    if not path.exists():
-        return pd.DataFrame()
-    try:
-        df = pd.read_excel(path, dtype=str)
-        if columns is not None:
-            keep = [c for c in columns if c in df.columns]
-            return df[keep].copy() if keep else pd.DataFrame()
-        return df
-    except Exception:
-        return pd.DataFrame()
 
 
 # application Streamlit
@@ -80,6 +52,17 @@ with st.expander("ℹ️ Comment ça marche ?", expanded=False):
         """)
 
 @st.cache_resource(show_spinner="Chargement artefacts…")
+
+def load_parquet_or_raw(parquet_name: str, raw_name: str) -> pd.DataFrame:
+    """Charge un petit artefact auxiliaire; fallback vers data/raw sans toucher FAISS."""
+    df = load_parquet(parquet_name)
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        return df
+    raw_path = Path("data/raw") / raw_name
+    if raw_path.exists():
+        return pd.read_excel(raw_path, dtype=str)
+    return pd.DataFrame()
+
 def load_all():
     manifest = read_manifest()
     df_acts = load_parquet(ART.df_activites_min)
@@ -91,28 +74,12 @@ def load_all():
     bm25_lois_bundle = load_joblib(ART.bm25_lois)
     faiss_lois_index = load_faiss(ART.faiss_lois)
     id_map_lois = load_parquet(ART.id_map_lois)
-    df_affiliations = load_parquet_optional("df_affiliations.parquet")
-    if df_affiliations.empty:
-        df_affiliations = load_raw_xlsx_optional(
-            "5_affiliations.xlsx",
-            ["representants_id", "denomination_affiliation"],
-        )
-
-    df_beneficiaires = load_parquet_optional("df_beneficiaires.parquet")
-    if df_beneficiaires.empty:
-        df_beneficiaires = load_raw_xlsx_optional(
-            "11_beneficiaires.xlsx",
-            ["action_representation_interet_id", "beneficiaire_action_menee"],
-        )
-
-    df_observations = load_parquet_optional("df_observations.parquet")
-    if df_observations.empty:
-        df_observations = load_raw_xlsx_optional(
-            "14_observations.xlsx",
-            ["activite_id", "action_representation_interet_id"],
-        )
-
-    df_benef_global = load_parquet_optional("df_beneficiaires_activites_globales.parquet")
+    # Petits artefacts auxiliaires : fallback vers data/raw si absents de artifacts/.
+    # Ne déclenche aucun rebuild FAISS/BM25.
+    df_affiliations = load_parquet_or_raw("df_affiliations.parquet", "5_affiliations.xlsx")
+    df_beneficiaires = load_parquet_or_raw("df_beneficiaires.parquet", "11_beneficiaires.xlsx")
+    df_observations = load_parquet_or_raw("df_observations.parquet", "14_observations.xlsx")
+    df_benef_global = load_parquet("df_beneficiaires_activites_globales.parquet")
 
     # rebuild FaissBundle doc_ids in index order
     doc_ids = id_map["activite_id"].astype(object).to_numpy()
@@ -213,13 +180,11 @@ def build_affiliations_organisations(org_search: pd.DataFrame) -> pd.DataFrame:
 def build_beneficiaires_activites(selected_res: pd.DataFrame) -> pd.DataFrame:
     """Bénéficiaires au niveau activité.
 
-    Jointure canonique validée dans app_serving_test.py:
-    selected.activite_id -> 14_observations.activite_id
-    -> action_representation_interet_id -> 11_beneficiaires.
+    Source de vérité: activite_id -> 14_observations.action_representation_interet_id
+    -> 11_beneficiaires.beneficiaire_action_menee.
 
-    Important: le résultat est agrégé par activite_id uniquement. Ne jamais
-    refusionner par denomination/objet_activite, car ces champs ne sont pas
-    des clés et peuvent rattacher les bénéficiaires à la mauvaise activité.
+    Important: cette fonction retourne une ligne par activite_id et ne groupe jamais
+    par denomination/objet_activite, car ces champs ne sont pas des clés uniques.
     """
     if selected_res is None or selected_res.empty:
         return pd.DataFrame()
@@ -232,7 +197,7 @@ def build_beneficiaires_activites(selected_res: pd.DataFrame) -> pd.DataFrame:
 
     acts = selected_res.copy()
     if "activite_id" not in acts.columns:
-        acts = acts.reset_index().rename(columns={acts.index.name or "index": "activite_id"})
+        acts = acts.reset_index().rename(columns={"index": "activite_id"})
     acts["activite_id"] = _norm_id_series(acts["activite_id"])
     selected_ids = set(acts["activite_id"].dropna())
 
@@ -254,19 +219,25 @@ def build_beneficiaires_activites(selected_res: pd.DataFrame) -> pd.DataFrame:
         detail.groupby("activite_id", dropna=False)
         .agg(
             nb_beneficiaires=("beneficiaire_action_menee", "nunique"),
-            beneficiaire_action_menee=("beneficiaire_action_menee", lambda s: _join_unique(s, max_items=80)),
+            beneficiaire_action_menee=("beneficiaire_action_menee", lambda ss: _join_unique(ss, max_items=80)),
         )
         .reset_index()
     )
 
 def add_beneficiaire_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Ajoute beneficiaire/nb_beneficiaires sans modifier les lignes d'activités.
+
+    Merge exclusivement sur activite_id. Si aucun bénéficiaire déclaré n'est trouvé,
+    on retombe sur denomination pour préserver le fonctionnement historique de l'UI.
+    """
     if df is None or df.empty:
         return df
 
     out = df.copy()
     if "activite_id" not in out.columns:
-        out = out.reset_index().rename(columns={out.index.name or "index": "activite_id"})
+        out = out.reset_index().rename(columns={"index": "activite_id"})
     out["activite_id"] = _norm_id_series(out["activite_id"])
+
     benef = build_beneficiaires_activites(out)
 
     if not benef.empty:
@@ -275,11 +246,10 @@ def add_beneficiaire_column(df: pd.DataFrame) -> pd.DataFrame:
             on="activite_id",
             how="left",
         )
-        fallback = out["denomination"] if "denomination" in out.columns else pd.Series([pd.NA] * len(out), index=out.index)
-        out["beneficiaire"] = out["beneficiaire_action_menee"].fillna(fallback)
+        out["beneficiaire"] = out["beneficiaire_action_menee"].fillna(out.get("denomination", ""))
         out = out.drop(columns=["beneficiaire_action_menee"], errors="ignore")
     else:
-        out["beneficiaire"] = out["denomination"] if "denomination" in out.columns else pd.NA
+        out["beneficiaire"] = out.get("denomination", pd.Series([pd.NA] * len(out), index=out.index))
         out["nb_beneficiaires"] = pd.NA
 
     return out
@@ -711,7 +681,7 @@ st.dataframe(benef_search, use_container_width=True)
 # =========================
 # MATRICE BULLES org x domaines - SUR selected_res
 # =========================
-st.markdown("### Matrice organisations × domaines")
+st.markdown("### Matrice bénéficiaires × domaines")
 
 MIN_BUDGET = float(min_budget)
 TOP_DOMAINS = 12  
@@ -793,7 +763,7 @@ else:
     cell = cell.sort_values(["beneficiaire", "domaines_list"])
 
     cell["hover"] = (
-        "<b>Organisation :</b> " + cell["beneficiaire"].astype(str) +
+        "<b>Bénéficiaire :</b> " + cell["beneficiaire"].astype(str) +
         "<br><b>Domaine :</b> " + cell["domaines_list"].astype(str) +
         "<br><b>Budget estimé sur la recherche (réparti) :</b> " + cell["budget_total"].fillna(0).replace([np.inf, -np.inf], 0).round(0).astype(int).astype(str) +
         "<br><b>Nb activités matching :</b> " + cell["nb_activites"].fillna(0).replace([np.inf, -np.inf], 0).astype(int).astype(str) +
@@ -826,9 +796,9 @@ else:
     left_margin = min(520, max(180, 7 * max_len_org))
 
     figm.update_layout(
-        title=f"Répartition du budget de lobbying par organisation et domaine.",
+        title=f"Répartition du budget de lobbying par bénéficiaire et domaine.",
         xaxis=dict(title="Domaines", categoryorder="array", categoryarray=dom_order, tickangle=45),
-        yaxis=dict(title="Organisations", categoryorder="array", categoryarray=org_order, autorange="reversed"),
+        yaxis=dict(title="Bénéficiaires", categoryorder="array", categoryarray=org_order, autorange="reversed"),
         height=max(650, 28 * len(org_order) + 240),
         margin=dict(l=left_margin, r=10, t=80, b=120),
     )
