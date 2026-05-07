@@ -3,7 +3,10 @@ import json
 from pathlib import Path
 import pandas as pd
 import joblib
-import faiss
+try:
+    import faiss
+except ImportError:
+    faiss = None
 from .config import PATHS, ART
 
 def artifacts_dir() -> Path:
@@ -27,10 +30,14 @@ def load_joblib(name: str):
     return joblib.load(p)
 
 def save_faiss(index, name: str) -> None:
+    if faiss is None:
+        raise ImportError("faiss n'est pas disponible dans cet environnement.")
     p = artifacts_dir() / name
     faiss.write_index(index, str(p))
 
 def load_faiss(name: str):
+    if faiss is None:
+        raise ImportError("faiss n'est pas disponible dans cet environnement.")
     p = artifacts_dir() / name
     return faiss.read_index(str(p))
 

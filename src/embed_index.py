@@ -1,11 +1,14 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np
-import faiss
+try:
+    import faiss
+except ImportError:
+    faiss = None
 
 @dataclass
 class FaissBundle:
-    index: faiss.Index
+    index: object
     doc_ids: np.ndarray  # position -> doc id (activite_id)
     normalize: bool = True  # cosine via inner product
 
@@ -21,6 +24,8 @@ def build_faiss_ivfpq(
     nbits: int = 8,
     normalize: bool = True,
 ) -> FaissBundle:
+    if faiss is None:
+        raise ImportError("faiss n'est pas disponible dans cet environnement.")
     emb = embeddings.astype("float32", copy=False)
     if normalize:
         emb = _l2_normalize(emb)
@@ -36,6 +41,8 @@ def build_faiss_ivfpq(
     return FaissBundle(index=index, doc_ids=doc_ids.astype(object), normalize=normalize)
 
 def faiss_search(bundle: FaissBundle, query_vec: np.ndarray, topk: int = 400, nprobe: int = 16):
+    if faiss is None or bundle is None or bundle.index is None:
+        raise RuntimeError("Recherche FAISS indisponible.")
     v = query_vec.astype("float32").reshape(1, -1)
     if bundle.normalize:
         v = v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-12)
