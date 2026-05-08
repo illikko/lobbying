@@ -33,7 +33,7 @@ from src.prep import (
     minify_lois,
     prepare_from_raw,
 )
-from src.search_backend import bm25_search_activites
+from src.search_backend import bm25_search_activites, hybrid_or_bm25_search_lois
 from src.textnorm import tokenize
 
 
@@ -225,17 +225,6 @@ def load_local_laws() -> pd.DataFrame:
     return df_lois
 
 
-def search_lois(df_lois: pd.DataFrame, bm25_lois_bundle, query_text: str, topn_laws: int) -> pd.DataFrame:
-    qtok = tokenize(query_text)
-    if not qtok:
-        return df_lois.iloc[0:0].copy()
-    scores = np.asarray(bm25_lois_bundle.bm25.get_scores(qtok), dtype=float)
-    idx = np.argsort(scores)[::-1][: int(topn_laws)]
-    out = df_lois.iloc[idx].copy()
-    out["bm25_score"] = scores[idx]
-    return out.sort_values("bm25_score", ascending=False)
-
-
 def format_date_yyyy_mm_dd(series: pd.Series) -> pd.Series:
     dates = pd.to_datetime(series, errors="coerce", dayfirst=True)
     return dates.dt.strftime("%Y-%m-%d").fillna("")
@@ -330,19 +319,6 @@ st.dataframe(analytics.table_organisations, use_container_width=True)
 st.markdown("### Table Bénéficiaires")
 st.dataframe(analytics.table_beneficiaires, use_container_width=True)
 
-st.markdown("### Debug")
-debug_detail = analytics.enriched.copy()
-debug_display = debug_detail[[c for c in ["activite_id", "denomination", "objet_activite", "beneficiaire", "budget_utilise"] if c in debug_detail.columns]].head(20)
-st.json(
-    {
-        "nb_activites_resultats": int(results["activite_id"].nunique()),
-        "nb_activites_selectionnees": int(analytics.table_activites["activite_id"].nunique()),
-        "nb_activites_avec_beneficiaire": int(debug_detail.loc[debug_detail["beneficiaire"].notna(), "activite_id"].nunique()),
-        "nb_beneficiaires_distincts": int(debug_detail["beneficiaire"].dropna().nunique()),
-    }
-)
-st.dataframe(debug_display, use_container_width=True)
-
 st.markdown("### Matrice bénéficiaires × domaines")
 matrix = explode_beneficiary_domains(analytics.enriched)
 if matrix.empty:
@@ -374,10 +350,10 @@ else:
         .tolist()
     )
     matrix_table["hover"] = (
-        "<b>BÃ©nÃ©ficiaire :</b> " + matrix_table["beneficiaire"].astype(str)
+        "<b>Bénéficiaire :</b> " + matrix_table["beneficiaire"].astype(str)
         + "<br><b>Domaine :</b> " + matrix_table["domaine"].astype(str)
-        + "<br><b>Budget rÃ©parti :</b> " + matrix_table["budget_estime_recherche"].round(0).astype(int).astype(str)
-        + "<br><b>Nb activitÃ©s :</b> " + matrix_table["nb_activites_matching"].astype(str)
+        + "<br><b>Budget réparti :</b> " + matrix_table["budget_estime_recherche"].round(0).astype(int).astype(str)
+        + "<br><b>Nb activités :</b> " + matrix_table["nb_activites_matching"].astype(str)
     )
     max_val = float(matrix_table["budget_estime_recherche"].max()) if len(matrix_table) else 1.0
     sizeref = 2.0 * max_val / (40 ** 2) if max_val > 0 else 1.0
@@ -409,7 +385,18 @@ if bm25_lois_bundle is None or df_lois.empty:
     st.info("Aucune base lois locale disponible.")
 else:
     topn_laws = st.slider("Nombre de lois", 5, 100, 20, 5)
-    lois_res = search_lois(df_lois, bm25_lois_bundle, current_query, int(topn_laws))
+    lois_res = hybrid_or_bm25_search_lois(
+        query=st.session_state.get("last_submitted_test_query", ""),
+        df_lois_min=df_lois,
+        bm25_bundle=bm25_lois_bundle,
+        faiss_bundle=None,
+        embed_query_fn=None,
+        search_backend="bm25",
+        k_bm25=400,
+        topn=int(topn_laws),
+        fusion_mode="rrf",
+        rrf_k=60,
+    )
     qtok = tokenize(current_query)
     all_law_scores = np.asarray(bm25_lois_bundle.bm25.get_scores(qtok), dtype=float) if qtok else np.asarray([], dtype=float)
     st.caption(

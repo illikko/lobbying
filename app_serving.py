@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from rank_bm25 import BM25Okapi
 import streamlit as st
 
 from src.activity_analytics import (
@@ -24,8 +23,11 @@ from src.config import ART
 from src.embed_index import FaissBundle
 from src.io_artifacts import load_joblib, load_parquet, load_faiss, read_manifest
 from src.llm_summarize import summarize_activites
-from src.search_backend import configured_search_backend, hybrid_or_bm25_search_activites
-from src.textnorm import tokenize
+from src.search_backend import (
+    configured_search_backend,
+    hybrid_or_bm25_search_activites,
+    hybrid_or_bm25_search_lois,
+)
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -140,9 +142,17 @@ def load_all():
     except (FileNotFoundError, ImportError):
         faiss_bundle = None
 
+    faiss_lois_bundle = None
+    try:
+        faiss_lois_index = load_faiss(ART.faiss_lois)
+        id_map_lois = load_parquet(ART.id_map_lois)
+        faiss_lois_bundle = FaissBundle(index=faiss_lois_index, doc_ids=id_map_lois["loi_id"].astype(object).to_numpy(), normalize=True)
+    except (FileNotFoundError, ImportError):
+        faiss_lois_bundle = None
+
     search_backend = configured_search_backend()
     embedder = None
-    if search_backend != "bm25" and faiss_bundle is not None and SentenceTransformer is not None:
+    if search_backend != "bm25" and (faiss_bundle is not None or faiss_lois_bundle is not None) and SentenceTransformer is not None:
         st_model = (manifest.get("config", {}) or {}).get(
             "st_model",
             "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
@@ -155,6 +165,7 @@ def load_all():
         "bm25_bundle": bm25_bundle,
         "bm25_lois_bundle": bm25_lois_bundle,
         "faiss_bundle": faiss_bundle,
+        "faiss_lois_bundle": faiss_lois_bundle,
         "embedder": embedder,
         "df_affiliations": load_parquet_or_raw("df_affiliations.parquet", "5_affiliations.xlsx"),
         "df_beneficiaires": load_parquet_or_raw("df_beneficiaires.parquet", "11_beneficiaires.xlsx"),
@@ -168,6 +179,7 @@ df_lois = STATE["df_lois"]
 bm25_bundle = STATE["bm25_bundle"]
 bm25_lois_bundle = STATE["bm25_lois_bundle"]
 faiss_bundle = STATE["faiss_bundle"]
+faiss_lois_bundle = STATE["faiss_lois_bundle"]
 embedder = STATE["embedder"]
 df_affiliations = STATE["df_affiliations"]
 df_beneficiaires = STATE["df_beneficiaires"]
@@ -182,14 +194,21 @@ def embed_query_fn(q: str) -> np.ndarray:
 
 
 def search_lois(query_text: str, topn_laws: int) -> pd.DataFrame:
-    qtok = tokenize(query_text)
-    if not qtok:
-        return df_lois.iloc[0:0].copy()
-    scores = np.asarray(bm25_lois_bundle.bm25.get_scores(qtok), dtype=float)
-    idx = np.argsort(scores)[::-1][: int(topn_laws)]
-    out = df_lois.iloc[idx].copy()
-    out["bm25_score"] = scores[idx]
-    return out.sort_values("bm25_score", ascending=False)
+    return hybrid_or_bm25_search_lois(
+        query=query_text,
+        df_lois_min=df_lois,
+        bm25_bundle=bm25_lois_bundle,
+        faiss_bundle=faiss_lois_bundle,
+        embed_query_fn=embed_query_fn if embedder is not None else None,
+        search_backend=configured_search_backend(),
+        k_bm25=400,
+        k_vec=400,
+        nprobe=16,
+        alpha_vec=0.55,
+        topn=int(topn_laws),
+        fusion_mode="rrf",
+        rrf_k=60,
+    )
 
 
 def first_theme(value) -> str:
@@ -404,7 +423,7 @@ if not show_laws.empty:
     for date_col in ["Date initiale", "Date de promulgation"]:
         if date_col in show_laws.columns:
             show_laws[date_col] = format_date_yyyy_mm_dd(show_laws[date_col])
-    laws_display = show_laws.rename(columns={"bm25_score": "score de pertinence"})
+    laws_display = show_laws.rename(columns={"hybrid_score": "score de pertinence"})
     law_column_order = [
         "selected",
         "Titre",

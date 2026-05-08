@@ -206,6 +206,8 @@ def build_activity_table(enriched: pd.DataFrame) -> pd.DataFrame:
         .reset_index()
     )
     acts["beneficiaires"] = acts["beneficiaires"].replace("", pd.NA)
+    if "hybrid_score" in acts.columns:
+        acts = acts.sort_values("hybrid_score", ascending=False, kind="stable")
     return acts
 
 
