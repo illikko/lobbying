@@ -2,16 +2,15 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import argparse
+import json
 import numpy as np
 import pandas as pd
 
-from sentence_transformers import SentenceTransformer
-
 from src.config import PATHS, ART
-from src.prep import prepare_from_raw, minify_activites, minify_lois, build_docs_activites, build_docs_lois
+from src.prep import prepare_from_imported, minify_activites, minify_lois, build_docs_activites, build_docs_lois
 from src.bm25_index import build_bm25
-from src.embed_index import build_faiss_ivfpq
 from src.io_artifacts import save_parquet, save_joblib, save_faiss, write_manifest, load_parquet
+from src.provenance import composite_source_fingerprint, sha256_file
 
 
 @dataclass
@@ -31,12 +30,15 @@ def _raw(p: str) -> str:
     return str((PATHS.data_raw / p).resolve())
 
 
-def _read_raw_xlsx(filename: str) -> pd.DataFrame:
-    """Lecture robuste des tables HATVP: les IDs doivent rester des chaînes."""
-    path = PATHS.data_raw / filename
+def _imported(p: str) -> str:
+    return str((PATHS.data_imported / p).resolve())
+
+
+def _read_imported(filename: str) -> pd.DataFrame:
+    path = PATHS.data_imported / filename
     if not path.exists():
-        raise FileNotFoundError(f"Fichier source manquant: {path}")
-    return pd.read_excel(path, dtype=str)
+        raise FileNotFoundError(f"Table Tricoteuses importée manquante: {path}. Lancez scripts/sync_all.py.")
+    return pd.read_parquet(path)
 
 
 def _norm_id_series(s: pd.Series) -> pd.Series:
@@ -115,9 +117,14 @@ def _normalise_auxiliary_tables(
     benef["beneficiaire_action_menee"] = benef["beneficiaire_action_menee"].astype("string").str.strip()
     benef = benef.dropna(subset=["action_representation_interet_id", "beneficiaire_action_menee"]).drop_duplicates()
 
-    obs = df_observations[["activite_id", "action_representation_interet_id"]].copy()
+    obs_cols = ["activite_id", "action_representation_interet_id"]
+    if "observation" in df_observations.columns:
+        obs_cols.append("observation")
+    obs = df_observations[obs_cols].copy()
     obs["activite_id"] = _norm_id_series(obs["activite_id"])
     obs["action_representation_interet_id"] = _norm_id_series(obs["action_representation_interet_id"])
+    if "observation" in obs.columns:
+        obs["observation"] = obs["observation"].astype("string").str.strip()
     obs = obs.dropna(subset=["activite_id", "action_representation_interet_id"]).drop_duplicates()
 
     return aff, benef, obs
@@ -194,11 +201,11 @@ def build_auxiliary_artifacts() -> None:
     les embeddings et l'index FAISS.
     """
     print("AUX 1/ Lecture tables auxiliaires HATVP", flush=True)
-    df_exercices_raw = _read_raw_xlsx("15_exercices.xlsx")
-    df_objets_raw = _read_raw_xlsx("8_objets_activites.xlsx")
-    df_affiliations_raw = _read_raw_xlsx("5_affiliations.xlsx")
-    df_beneficiaires_raw = _read_raw_xlsx("11_beneficiaires.xlsx")
-    df_observations_raw = _read_raw_xlsx("14_observations.xlsx")
+    df_exercices_raw = _read_imported("exercices.parquet")
+    df_objets_raw = _read_imported("objets_activites.parquet")
+    df_affiliations_raw = _read_imported("affiliations.parquet")
+    df_beneficiaires_raw = _read_imported("beneficiaires.parquet")
+    df_observations_raw = _read_imported("observations.parquet")
 
     df_affiliations, df_beneficiaires, df_observations = _normalise_auxiliary_tables(
         df_affiliations_raw,
@@ -235,26 +242,25 @@ def build_auxiliary_artifacts() -> None:
         flush=True,
     )
 
-def build_all(cfg: BuildConfig) -> None:
-    print("1/ Préparation coeur activités + lois", flush=True)
-    # 1) Prepare coeur historique: activités, lois, BM25, FAISS.
-    df_acts, df_lois = prepare_from_raw(
-        xlsx_organisations=_raw("1_informations_generales.xlsx"),
-        xlsx_activites=_raw("8_objets_activites.xlsx"),
-        xlsx_exercices=_raw("15_exercices.xlsx"),
-        xlsx_domaines=_raw("7_domaines_intervention.xlsx"),
-        csv_ppl=_raw("ppl.csv"),
-        csv_promulguees=_raw("promulguees.csv"),
+def build_all(cfg: BuildConfig, include_faiss: bool = True) -> None:
+    print("1/ Préparation coeur activités + décisions publiques", flush=True)
+    # 1) Prépare activités + décisions publiques, puis BM25/FAISS.
+    df_acts, df_lois = prepare_from_imported(
+        parquet_organisations=_imported("informations_generales.parquet"),
+        parquet_activites=_imported("objets_activites.parquet"),
+        parquet_exercices=_imported("exercices.parquet"),
+        parquet_domaines=_imported("domaines_intervention.parquet"),
+        parquet_decisions=str(PATHS.decisions_raw),
     )
 
     print("2/ Lecture tables auxiliaires HATVP", flush=True)
     # 2) Nouvelles tables brutes HATVP, même snapshot que les autres fichiers.
-    df_exercices_raw = _read_raw_xlsx("15_exercices.xlsx")
-    df_objets_raw = _read_raw_xlsx("8_objets_activites.xlsx")
-    df_infos = _read_raw_xlsx("1_informations_generales.xlsx")
-    df_affiliations_raw = _read_raw_xlsx("5_affiliations.xlsx")
-    df_beneficiaires_raw = _read_raw_xlsx("11_beneficiaires.xlsx")
-    df_observations_raw = _read_raw_xlsx("14_observations.xlsx")
+    df_exercices_raw = _read_imported("exercices.parquet")
+    df_objets_raw = _read_imported("objets_activites.parquet")
+    df_infos = _read_imported("informations_generales.parquet")
+    df_affiliations_raw = _read_imported("affiliations.parquet")
+    df_beneficiaires_raw = _read_imported("beneficiaires.parquet")
+    df_observations_raw = _read_imported("observations.parquet")
 
     df_affiliations, df_beneficiaires, df_observations = _normalise_auxiliary_tables(
         df_affiliations_raw,
@@ -274,8 +280,8 @@ def build_all(cfg: BuildConfig) -> None:
 
     df_lois_min = minify_lois(df_lois)
 
-    print("5/ Construction docs + index lois", flush=True)
-    # --- Docs lois
+    print("5/ Construction docs + index décisions publiques", flush=True)
+    # --- Docs décisions (noms historiques conservés pour compatibilité)
     df_lois_min = df_lois_min.reset_index(drop=True)  # index propre 0..N
     docs_lois = build_docs_lois(df_lois_min)
     loi_ids = docs_lois["loi_id"].to_numpy(dtype=object)
@@ -283,7 +289,7 @@ def build_all(cfg: BuildConfig) -> None:
 
     save_parquet(docs_lois.set_index("loi_id"), ART.docs_lois)
 
-    # --- BM25 lois
+    # --- BM25 décisions
     bm25_lois_bundle = build_bm25(doc_ids=loi_ids, doc_texts=loi_texts)
     save_joblib(bm25_lois_bundle, ART.bm25_lois)
 
@@ -297,6 +303,7 @@ def build_all(cfg: BuildConfig) -> None:
     print("6/ Sauvegarde artefacts tables + auxiliaires", flush=True)
     # 3) Save minified + nouvelles tables propres.
     save_parquet(df_acts_min, ART.df_activites_min)
+    save_parquet(df_infos, "df_informations_generales.parquet")
     save_parquet(df_lois_min, ART.df_lois_min)
     save_parquet(docs.set_index("activite_id"), ART.docs_activites)
     save_parquet(df_affiliations, "df_affiliations.parquet")
@@ -319,56 +326,57 @@ def build_all(cfg: BuildConfig) -> None:
     bm25_bundle = build_bm25(doc_ids=doc_ids, doc_texts=doc_texts)
     save_joblib(bm25_bundle, ART.bm25_activites)
 
-    print("9/ Construction embeddings + FAISS", flush=True)
-    # 5) Embeddings + FAISS (ACTIVITES + LOIS)
-    model = SentenceTransformer(cfg.st_model)
+    if include_faiss:
+        print("9/ Construction embeddings + FAISS", flush=True)
+        # Imports lourds uniquement dans le build production. Le mode local BM25
+        # n'a besoin ni de sentence-transformers, ni de torch, ni de faiss.
+        from sentence_transformers import SentenceTransformer
+        from src.embed_index import build_faiss_ivfpq
 
-    print("9a/ Encodage activités", flush=True)
-    # --- Activités
-    emb = model.encode(doc_texts, batch_size=128, show_progress_bar=True, convert_to_numpy=True)
-    emb = emb.astype("float32", copy=False)
+        model = SentenceTransformer(cfg.st_model)
 
-    faiss_bundle = build_faiss_ivfpq(
-        embeddings=emb,
-        doc_ids=doc_ids,
-        nlist=cfg.nlist,
-        m=cfg.m,
-        nbits=cfg.nbits,
-        normalize=cfg.normalize,
-    )
-    save_faiss(faiss_bundle.index, ART.faiss_activites)
-    print("9b/ FAISS activités sauvegardé", flush=True)
+        print("9a/ Encodage activités", flush=True)
+        emb = model.encode(doc_texts, batch_size=128, show_progress_bar=True, convert_to_numpy=True)
+        emb = emb.astype("float32", copy=False)
+        faiss_bundle = build_faiss_ivfpq(
+            embeddings=emb, doc_ids=doc_ids, nlist=cfg.nlist, m=cfg.m,
+            nbits=cfg.nbits, normalize=cfg.normalize,
+        )
+        save_faiss(faiss_bundle.index, ART.faiss_activites)
 
-    id_map = pd.DataFrame({"pos": np.arange(len(doc_ids), dtype=int), "activite_id": doc_ids.astype(str)})
-    save_parquet(id_map.set_index("pos"), ART.id_map_activites)
+        id_map = pd.DataFrame({"pos": np.arange(len(doc_ids), dtype=int), "activite_id": doc_ids.astype(str)})
+        save_parquet(id_map.set_index("pos"), ART.id_map_activites)
 
-    print("9c/ Encodage lois", flush=True)
-    # --- Lois
-    emb_lois = model.encode(loi_texts, batch_size=128, show_progress_bar=True, convert_to_numpy=True)
-    emb_lois = emb_lois.astype("float32", copy=False)
-
-    faiss_lois_bundle = build_faiss_ivfpq(
-        embeddings=emb_lois,
-        doc_ids=loi_ids,
-        nlist=max(256, cfg.nlist // 4),
-        m=cfg.m,
-        nbits=cfg.nbits,
-        normalize=cfg.normalize,
-    )
-    save_faiss(faiss_lois_bundle.index, ART.faiss_lois)
-
-    id_map_lois = pd.DataFrame({"pos": np.arange(len(loi_ids), dtype=int), "loi_id": loi_ids.astype(str)})
-    save_parquet(id_map_lois.set_index("pos"), ART.id_map_lois)
-    print("9d/ FAISS lois sauvegardé", flush=True)
+        print("9b/ Encodage décisions publiques", flush=True)
+        emb_lois = model.encode(loi_texts, batch_size=128, show_progress_bar=True, convert_to_numpy=True)
+        emb_lois = emb_lois.astype("float32", copy=False)
+        faiss_lois_bundle = build_faiss_ivfpq(
+            embeddings=emb_lois, doc_ids=loi_ids, nlist=max(256, cfg.nlist // 4),
+            m=cfg.m, nbits=cfg.nbits, normalize=cfg.normalize,
+        )
+        save_faiss(faiss_lois_bundle.index, ART.faiss_lois)
+        id_map_lois = pd.DataFrame({"pos": np.arange(len(loi_ids), dtype=int), "loi_id": loi_ids.astype(str)})
+        save_parquet(id_map_lois.set_index("pos"), ART.id_map_lois)
+        print("9c/ FAISS activités + décisions sauvegardé", flush=True)
+    else:
+        print("9/ Mode BM25 : embeddings et FAISS ignorés", flush=True)
 
     print("10/ Écriture manifest", flush=True)
     # 6) manifest
+    import_manifest_path = PATHS.data_imported / "import_manifest.json"
+    import_manifest = json.loads(import_manifest_path.read_text(encoding="utf-8")) if import_manifest_path.exists() else {}
+    composite_fp = composite_source_fingerprint(import_manifest_path, PATHS.decisions_raw)
     manifest = {
         "built_at": datetime.utcnow().isoformat() + "Z",
-        "config": asdict(cfg),
+        "source_fingerprint": composite_fp,
+        "hatvp_source_fingerprint": import_manifest.get("source_fingerprint"),
+        "decisions_source_fingerprint": sha256_file(PATHS.decisions_raw),
+        "source_imported_at": import_manifest.get("imported_at"),
+        "config": {**asdict(cfg), "include_faiss": include_faiss},
+        "search_indexes": ["bm25", "faiss"] if include_faiss else ["bm25"],
         "counts": {
             "activites": int(df_acts_min.shape[0]),
-            "lois": int(df_lois_min.shape[0]),
+            "decisions_publiques": int(df_lois_min.shape[0]),
             "docs_activites": int(len(doc_texts)),
             "affiliations": int(df_affiliations.shape[0]),
             "beneficiaires": int(df_beneficiaires.shape[0]),
@@ -381,6 +389,7 @@ def build_all(cfg: BuildConfig) -> None:
             "bm25_activites": ART.bm25_activites,
             "faiss_activites": ART.faiss_activites,
             "id_map_activites": ART.id_map_activites,
+            "df_informations_generales": "df_informations_generales.parquet",
             "df_affiliations": "df_affiliations.parquet",
             "df_beneficiaires": "df_beneficiaires.parquet",
             "df_observations": "df_observations.parquet",
@@ -397,6 +406,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Reconstruit seulement les petits artefacts auxiliaires, sans BM25/FAISS.",
     )
+    parser.add_argument(
+        "--no-faiss",
+        action="store_true",
+        help="Construit Parquet + BM25 uniquement, sans embeddings, sentence-transformers ni FAISS.",
+    )
     args = parser.parse_args()
 
     if args.aux_only:
@@ -405,5 +419,5 @@ if __name__ == "__main__":
     else:
         print("Début build_artifacts", flush=True)
         cfg = BuildConfig()
-        build_all(cfg)
+        build_all(cfg, include_faiss=not args.no_faiss)
         print("✅ Artifacts built in ./artifacts", flush=True)

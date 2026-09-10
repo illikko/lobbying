@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import re
 import zlib
 
@@ -23,22 +24,26 @@ from src.activity_analytics import (
     validate_three_tables_share_same_enriched_source,
 )
 from src.bm25_index import build_bm25
-from src.config import ART
+from src.config import ART, PATHS
 from src.io_artifacts import load_joblib, load_parquet
-from src.llm_summarize import summarize_activites
 from src.prep import (
     clean_columns,
     concat_sur_liste_colonnes,
     minify_activites,
     minify_lois,
-    prepare_from_raw,
+    prepare_from_imported,
 )
 from src.search_backend import bm25_search_activites, hybrid_or_bm25_search_lois
 from src.textnorm import tokenize
 
 
-st.set_page_config(page_title="Test local BM25 lobbying", layout="wide")
-st.title("Test local BM25 uniquement")
+PREBUILT_ONLY = os.getenv("LOBBYSEARCH_PREBUILT_ONLY", "0") == "1"
+ENABLE_LLM = os.getenv("LOBBYSEARCH_ENABLE_LLM", "1") == "1"
+
+st.set_page_config(page_title="Test BM25 LobbySearch", layout="wide")
+st.title("Test BM25 uniquement")
+
+LOCAL_TEST_ARTIFACTS = Path(__file__).resolve().parent / "local_test_artifacts"
 
 
 def norm_id_series(series: pd.Series) -> pd.Series:
@@ -59,16 +64,19 @@ def explode_ids(df: pd.DataFrame, col: str) -> pd.DataFrame:
     return out.dropna(subset=[col])
 
 
-def load_repo_table(parquet_name: str, raw_name: str | None = None) -> pd.DataFrame:
+def load_repo_table(parquet_name: str, imported_name: str | None = None) -> pd.DataFrame:
     try:
         return load_parquet(parquet_name)
     except FileNotFoundError:
-        if raw_name is None:
-            return pd.DataFrame()
-        raw_path = Path("data/raw") / raw_name
-        if raw_path.suffix.lower() in {".xlsx", ".xls"} and raw_path.exists():
-            return pd.read_excel(raw_path, dtype=str)
-        return pd.DataFrame()
+        pass
+    local_snapshot = LOCAL_TEST_ARTIFACTS / parquet_name
+    if local_snapshot.exists():
+        return pd.read_parquet(local_snapshot)
+    if imported_name is not None:
+        path = PATHS.data_imported / imported_name
+        if path.exists():
+            return pd.read_parquet(path)
+    return pd.DataFrame()
 
 
 def load_local_activities() -> pd.DataFrame:
@@ -78,6 +86,11 @@ def load_local_activities() -> pd.DataFrame:
         return df
     except FileNotFoundError:
         pass
+    local_snapshot = LOCAL_TEST_ARTIFACTS / ART.df_activites_min
+    if local_snapshot.exists():
+        df = ensure_activite_id(pd.read_parquet(local_snapshot))
+        df.index = df["activite_id"].astype(str)
+        return df
     for path in [Path("activites.csv"), Path("df.csv")]:
         if path.exists():
             df = pd.read_csv(path, sep=";", dtype=str, encoding="utf-8-sig")
@@ -90,31 +103,29 @@ def load_local_activities() -> pd.DataFrame:
     raise FileNotFoundError("Aucune base activités locale trouvée.")
 
 
-def load_local_activities_from_raw() -> pd.DataFrame:
-    raw_paths = {
-        "xlsx_organisations": Path("data/raw/1_informations_generales.xlsx"),
-        "xlsx_activites": Path("data/raw/8_objets_activites.xlsx"),
-        "xlsx_exercices": Path("data/raw/15_exercices.xlsx"),
-        "xlsx_domaines": Path("data/raw/7_domaines_intervention.xlsx"),
-        "csv_ppl": Path("data/raw/ppl.csv"),
-        "csv_promulguees": Path("data/raw/promulguees.csv"),
-    }
-    if not all(path.exists() for path in raw_paths.values()):
+def load_local_activities_from_imported() -> pd.DataFrame:
+    required = [
+        PATHS.data_imported / "informations_generales.parquet",
+        PATHS.data_imported / "objets_activites.parquet",
+        PATHS.data_imported / "exercices.parquet",
+        PATHS.data_imported / "domaines_intervention.parquet",
+        PATHS.decisions_raw,
+    ]
+    if not all(path.exists() for path in required):
         raise FileNotFoundError(
-            "Aucune base activités locale trouvée. Attendu: "
-            "artifacts/df_activites_min.parquet ou reconstruction depuis data/raw/."
+            "Aucun artefact local et tables importées incomplètes. "
+            "Exécutez d’abord : python scripts/sync_local_bm25.py. "
+            "Cette synchronisation locale utilise Docker et reconstruit uniquement Parquet + BM25, sans FAISS."
         )
 
-    df_acts_full, _ = prepare_from_raw(
-        xlsx_organisations=str(raw_paths["xlsx_organisations"]),
-        xlsx_activites=str(raw_paths["xlsx_activites"]),
-        xlsx_exercices=str(raw_paths["xlsx_exercices"]),
-        xlsx_domaines=str(raw_paths["xlsx_domaines"]),
-        csv_ppl=str(raw_paths["csv_ppl"]),
-        csv_promulguees=str(raw_paths["csv_promulguees"]),
+    df_acts_full, _ = prepare_from_imported(
+        parquet_organisations=str(PATHS.data_imported / "informations_generales.parquet"),
+        parquet_activites=str(PATHS.data_imported / "objets_activites.parquet"),
+        parquet_exercices=str(PATHS.data_imported / "exercices.parquet"),
+        parquet_domaines=str(PATHS.data_imported / "domaines_intervention.parquet"),
+        parquet_decisions=str(PATHS.decisions_raw),
     )
-    df = minify_activites(df_acts_full)
-    df = df.reset_index()
+    df = minify_activites(df_acts_full).reset_index()
     if "representants_id" in df_acts_full.columns:
         representants = (
             df_acts_full[["representants_id"]]
@@ -183,46 +194,70 @@ def build_local_bm25_bundle(df_acts: pd.DataFrame):
     try:
         return load_joblib(ART.bm25_activites)
     except FileNotFoundError:
+        local_snapshot = LOCAL_TEST_ARTIFACTS / ART.bm25_activites
+        if local_snapshot.exists():
+            return __import__("joblib").load(local_snapshot)
         docs = (df_acts.get("objet_activite", "").fillna("").astype(str) + " " + df_acts.get("denomination", "").fillna("").astype(str) + " " + df_acts.get("domaines", "").fillna("").astype(str)).tolist()
         doc_ids = df_acts["activite_id"].astype(object).to_numpy()
         return build_bm25(doc_ids=doc_ids, doc_texts=docs)
 
 
 def build_lois_bm25_bundle(df_lois: pd.DataFrame):
-    docs = (df_lois.get("Titre", "").fillna("").astype(str) + " " + df_lois.get("Thèmes", "").fillna("").astype(str)).tolist()
-    doc_ids = np.arange(len(df_lois), dtype=object)
-    return build_bm25(doc_ids=doc_ids, doc_texts=docs)
-
-
-def load_local_laws() -> pd.DataFrame:
+    # 1. Utiliser en priorité le BM25 construit à partir
+    #    des décisions actuellement présentes dans artifacts/
     try:
-        df_lois = load_parquet(ART.df_lois_min)
-        return df_lois.reset_index(drop=True)
+        return load_joblib(ART.bm25_lois)
     except FileNotFoundError:
         pass
 
-    ppl_path = Path("data/raw/ppl.csv")
-    prom_path = Path("data/raw/promulguees.csv")
-    if not ppl_path.exists() or not prom_path.exists():
-        return pd.DataFrame()
+    # 2. Snapshot historique uniquement comme dernier recours
+    local_snapshot = LOCAL_TEST_ARTIFACTS / ART.bm25_lois
 
-    df_ppl = pd.read_csv(ppl_path, sep=";", encoding="latin-1")
-    df_prom = pd.read_csv(prom_path, sep=";", encoding="latin-1")
-    df_ppl = clean_columns(df_ppl)
-    df_prom = clean_columns(df_prom)
-    if "Date de dépôt" in df_ppl.columns:
-        df_ppl = df_ppl.rename(columns={"Date de dépôt": "Date initiale"})
+    if local_snapshot.exists():
+        return __import__("joblib").load(local_snapshot)
 
-    df_lois = concat_sur_liste_colonnes(
-        df_ppl,
-        df_prom,
-        cols=["Date initiale", "Date de promulgation", "Titre", "Numéro de la loi", "Thèmes", "État du dossier", "URL du dossier"],
+    # 3. À défaut, reconstruire un BM25 en mémoire
+    docs = (
+        df_lois.get("Titre", "").fillna("").astype(str)
+        + " "
+        + df_lois.get("Description", "").fillna("").astype(str)
+        + " "
+        + df_lois.get("Thèmes", "").fillna("").astype(str)
+    ).tolist()
+
+    doc_ids = np.arange(
+        len(df_lois),
+        dtype=object,
     )
-    df_lois["Date initiale"] = pd.to_datetime(df_lois["Date initiale"], errors="coerce", dayfirst=True)
-    df_lois["Date de promulgation"] = pd.to_datetime(df_lois["Date de promulgation"], errors="coerce", dayfirst=True)
-    df_lois = df_lois[df_lois["Date initiale"] >= pd.Timestamp("2018-01-01")]
-    df_lois = minify_lois(df_lois).reset_index(drop=True)
-    return df_lois
+
+    return build_bm25(
+        doc_ids=doc_ids,
+        doc_texts=docs,
+    )
+
+
+def load_local_laws() -> pd.DataFrame:
+    # Nom historique dans l'UI : ce DataFrame contient désormais les décisions publiques
+    # (lois, décrets, ordonnances, arrêtés), jamais les amendements.
+    try:
+        return load_parquet(ART.df_lois_min)
+    except FileNotFoundError:
+        pass
+    local_snapshot = LOCAL_TEST_ARTIFACTS / ART.df_lois_min
+    if local_snapshot.exists():
+        df = pd.read_parquet(local_snapshot)
+        # Le snapshot local historique provient des anciens corpus législatifs
+        # (PPL/promulguées) : ce sont des lois. Les snapshots Canutes récents
+        # fournissent directement type_decision et ne passent pas par ce fallback.
+        if "type_decision" not in df.columns:
+            df.insert(0, "type_decision", "loi")
+        return df
+    if not PATHS.decisions_raw.exists():
+        return pd.DataFrame()
+    df = pd.read_parquet(PATHS.decisions_raw)
+    if "type_decision" in df.columns:
+        df = df[df["type_decision"].isin(["loi", "decret", "ordonnance", "arrete"])].copy()
+    return minify_lois(df)
 
 
 def format_date_yyyy_mm_dd(series: pd.Series) -> pd.Series:
@@ -242,12 +277,20 @@ def stable_jitter(value: str, scale: float = 0.25) -> float:
 
 @st.cache_resource(show_spinner="Chargement des fichiers du repo…")
 def load_local_state():
+    if PREBUILT_ONLY:
+        from src.serving_snapshot import load_snapshot
+
+        state = load_snapshot(PATHS.artifacts)
+        state["df_acts"] = fill_missing_category_from_infos(
+            state["df_acts"], state.pop("df_informations_generales")
+        )
+        return state
     try:
         df_acts = ensure_activite_id(load_parquet(ART.df_activites_min))
         df_acts.index = df_acts["activite_id"].astype(str)
     except FileNotFoundError:
-        df_acts = load_local_activities_from_raw()
-    df_infos = load_repo_table("df_informations_generales.parquet", "1_informations_generales.xlsx")
+        df_acts = load_local_activities()
+    df_infos = load_repo_table("df_informations_generales.parquet", "informations_generales.parquet")
     df_acts = fill_missing_category_from_infos(df_acts, df_infos)
     df_lois = load_local_laws()
     return {
@@ -255,13 +298,17 @@ def load_local_state():
         "df_lois": df_lois,
         "bm25_bundle": build_local_bm25_bundle(df_acts),
         "bm25_lois_bundle": build_lois_bm25_bundle(df_lois) if not df_lois.empty else None,
-        "df_observations": load_repo_table("df_observations.parquet", "14_observations.xlsx"),
-        "df_beneficiaires": load_repo_table("df_beneficiaires.parquet", "11_beneficiaires.xlsx"),
-        "df_affiliations": load_repo_table("df_affiliations.parquet", "5_affiliations.xlsx"),
+        "df_observations": load_repo_table("df_observations.parquet", "observations.parquet"),
+        "df_beneficiaires": load_repo_table("df_beneficiaires.parquet", "beneficiaires.parquet"),
+        "df_affiliations": load_repo_table("df_affiliations.parquet", "affiliations.parquet"),
     }
 
 
-STATE = load_local_state()
+try:
+    STATE = load_local_state()
+except (FileNotFoundError, ValueError) as exc:
+    st.error(str(exc))
+    st.stop()
 df_acts = STATE["df_acts"]
 df_lois = STATE["df_lois"]
 bm25_bundle = STATE["bm25_bundle"]
@@ -379,12 +426,12 @@ else:
     st.plotly_chart(figm, use_container_width=True)
     st.dataframe(matrix_table.drop(columns=["hover"]), use_container_width=True)
 
-st.markdown("### Lois correspondant à la recherche")
+st.markdown("### Décisions publiques correspondant à la recherche")
 if bm25_lois_bundle is None or df_lois.empty:
     selected_lois = pd.DataFrame()
-    st.info("Aucune base lois locale disponible.")
+    st.info("Aucune base de décisions publiques locale disponible.")
 else:
-    topn_laws = st.slider("Nombre de lois", 5, 100, 20, 5)
+    topn_laws = st.slider("Nombre de décisions", 5, 100, 20, 5)
     lois_res = hybrid_or_bm25_search_lois(
         query=st.session_state.get("last_submitted_test_query", ""),
         df_lois_min=df_lois,
@@ -400,9 +447,9 @@ else:
     qtok = tokenize(current_query)
     all_law_scores = np.asarray(bm25_lois_bundle.bm25.get_scores(qtok), dtype=float) if qtok else np.asarray([], dtype=float)
     st.caption(
-        f"Lois avec score BM25 strictement positif sur tout le corpus : {int((all_law_scores > 0).sum()) if len(all_law_scores) else 0}"
+        f"Décisions publiques avec score BM25 strictement positif sur tout le corpus : {int((all_law_scores > 0).sum()) if len(all_law_scores) else 0}"
     )
-    hide_zero_scores = st.checkbox("Masquer les lois à score nul", value=True)
+    hide_zero_scores = st.checkbox("Masquer les décisions à score nul", value=True)
     show_laws = lois_res.copy()
     if hide_zero_scores and "bm25_score" in show_laws.columns:
         show_laws = show_laws[show_laws["bm25_score"] > 0].copy()
@@ -410,13 +457,29 @@ else:
         for date_col in ["Date initiale", "Date de promulgation"]:
             if date_col in show_laws.columns:
                 show_laws[date_col] = format_date_yyyy_mm_dd(show_laws[date_col])
-        st.dataframe(show_laws, use_container_width=True)
+        laws_display = show_laws.rename(columns={"hybrid_score": "score de pertinence"}).copy()
+        law_column_order = [
+            "type_decision",
+            "Titre",
+            "Description",
+            "Numéro de la loi",
+            "Thèmes",
+            "Date initiale",
+            "Date de promulgation",
+            "État du dossier",
+            "URL du dossier",
+            "score de pertinence",
+        ]
+        laws_display = laws_display[[c for c in law_column_order if c in laws_display.columns]]
+        if "type_decision" in laws_display.columns:
+            laws_display["type_decision"] = laws_display["type_decision"].astype(str).str.upper()
+        st.dataframe(laws_display, use_container_width=True)
         selected_lois = show_laws.copy()
     else:
         selected_lois = pd.DataFrame()
-        st.info("Aucune loi trouvée.")
+        st.info("Aucune décision publique trouvée.")
 
-st.markdown("### Chronologie activités & lois")
+st.markdown("### Chronologie activités & décisions publiques")
 acts = analytics.table_activites.copy()
 acts["date_evt"] = pd.to_datetime(acts.get("date_publication_activite"), errors="coerce")
 acts = acts.dropna(subset=["date_evt"])
@@ -445,18 +508,19 @@ if not laws.empty:
             x=laws["x"],
             y=laws["date_evt"],
             mode="markers",
-            name="Lois",
+            name="Décisions publiques",
             marker=dict(size=10, symbol="square", color=[color_map[t] for t in laws["theme"]]),
             customdata=np.stack(
                 [
                     laws.get("Titre", pd.Series([""] * len(laws))).astype(str).to_numpy(),
+                    laws.get("Description", pd.Series([""] * len(laws))).astype(str).to_numpy(),
                     laws.get("Thèmes", pd.Series([""] * len(laws))).astype(str).to_numpy(),
                     laws.get("Date de promulgation", pd.Series([""] * len(laws))).astype(str).to_numpy(),
                     laws.get("bm25_score", pd.Series([0.0] * len(laws))).round(3).astype(str).to_numpy(),
                 ],
                 axis=1,
             ),
-            hovertemplate="<b>Loi</b><br>Titre: %{customdata[0]}<br>Thèmes: %{customdata[1]}<br>Promulgation: %{customdata[2]}<br>Score BM25: %{customdata[3]}<extra></extra>",
+            hovertemplate="<b>Décision publique</b><br>Titre: %{customdata[0]}<br>Description: %{customdata[1]}<br>Thèmes: %{customdata[2]}<br>Promulgation: %{customdata[3]}<br>Score BM25: %{customdata[4]}<extra></extra>",
         )
     )
 if not acts.empty:
@@ -479,13 +543,16 @@ if not acts.empty:
             hovertemplate="<b>Activité</b><br>Bénéficiaire(s): %{customdata[0]}<br>Objet: %{customdata[1]}<br>Domaines: %{customdata[2]}<br>Budget utilisé: %{customdata[3]}<extra></extra>",
         )
     )
-figt.update_layout(height=900, xaxis_title="Lois ← | → Activités", yaxis_title="Date")
+figt.update_layout(height=900, xaxis_title="Décisions publiques ← | → Activités", yaxis_title="Date")
 st.plotly_chart(figt, use_container_width=True)
 
-st.markdown("### Payload LLM")
-payload = build_llm_payload(current_query, analytics)
-st.json(payload, expanded=False)
-if st.button("Générer la synthèse test"):
-    st.session_state.test_synth = summarize_activites(payload)
-if st.session_state.get("test_synth"):
-    st.text_area("Synthèse", st.session_state.test_synth, height=400)
+if ENABLE_LLM:
+    st.markdown("### Payload LLM")
+    payload = build_llm_payload(current_query, analytics)
+    st.json(payload, expanded=False)
+    if st.button("Générer la synthèse test"):
+        from src.llm_summarize import summarize_activites
+
+        st.session_state.test_synth = summarize_activites(payload)
+    if st.session_state.get("test_synth"):
+        st.text_area("Synthèse", st.session_state.test_synth, height=400)

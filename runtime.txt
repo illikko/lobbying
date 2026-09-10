@@ -1,4 +1,1 @@
-echo python-3.12.2 > runtime.txt
-git add runtime.txt
-git commit -m "Add runtime.txt (python-3.12.2)"
-git push
+python-3.12.2

@@ -38,16 +38,16 @@ except ImportError:
 st.set_page_config(page_title="Cartographie des influences", layout="wide")
 
 
-def load_parquet_or_raw(parquet_name: str, raw_name: str) -> pd.DataFrame:
+def load_parquet_or_imported(parquet_name: str, imported_name: str) -> pd.DataFrame:
     try:
         df = load_parquet(parquet_name)
         if isinstance(df, pd.DataFrame) and not df.empty:
             return df
     except FileNotFoundError:
         pass
-    raw_path = Path("data/raw") / raw_name
-    if raw_path.exists():
-        return pd.read_excel(raw_path, dtype=str)
+    imported_path = Path("data/imported") / imported_name
+    if imported_path.exists():
+        return pd.read_parquet(imported_path)
     return pd.DataFrame()
 
 
@@ -125,9 +125,21 @@ def format_date_yyyy_mm_dd(series: pd.Series) -> pd.Series:
 @st.cache_resource(show_spinner="Chargement des artefacts…")
 def load_all():
     manifest = read_manifest()
+    import_manifest_path = Path("data/imported/import_manifest.json")
+    if import_manifest_path.exists():
+        try:
+            import_manifest = __import__("json").loads(import_manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            import_manifest = {}
+        source_fp = import_manifest.get("source_fingerprint")
+        if source_fp and manifest.get("source_fingerprint") != source_fp:
+            raise RuntimeError(
+                "Artefacts LobbySearch désalignés avec le snapshot Tricoteuses. "
+                "Exécutez: python scripts/sync_all.py --no-fetch"
+            )
     df_acts = ensure_activite_id(load_parquet(ART.df_activites_min))
     df_lois = load_parquet(ART.df_lois_min)
-    df_infos = load_parquet_or_raw("df_informations_generales.parquet", "1_informations_generales.xlsx")
+    df_infos = load_parquet_or_imported("df_informations_generales.parquet", "informations_generales.parquet")
     df_acts = fill_missing_category_from_infos(df_acts, df_infos)
     df_acts.index = df_acts["activite_id"].astype(str)
 
@@ -167,9 +179,9 @@ def load_all():
         "faiss_bundle": faiss_bundle,
         "faiss_lois_bundle": faiss_lois_bundle,
         "embedder": embedder,
-        "df_affiliations": load_parquet_or_raw("df_affiliations.parquet", "5_affiliations.xlsx"),
-        "df_beneficiaires": load_parquet_or_raw("df_beneficiaires.parquet", "11_beneficiaires.xlsx"),
-        "df_observations": load_parquet_or_raw("df_observations.parquet", "14_observations.xlsx"),
+        "df_affiliations": load_parquet_or_imported("df_affiliations.parquet", "affiliations.parquet"),
+        "df_beneficiaires": load_parquet_or_imported("df_beneficiaires.parquet", "beneficiaires.parquet"),
+        "df_observations": load_parquet_or_imported("df_observations.parquet", "observations.parquet"),
     }
 
 
@@ -234,10 +246,10 @@ with st.expander("ℹ️ À propos de l'application", expanded=False):
         Les résultats de la recherche sont présentés sous forme de:  
         • tableau avec des filtres interactifs  
         • matrice à bulles représentant les organisations et les domaines d'activité  
-        • frise chronoligique des activités de lobbying et des lois  
+        • frise chronologique des activités de lobbying et des décisions publiques  
         • synthèse par IA des activités de lobbying  
         
-        Elle utilise les données ouvertes de la HATPV sur les activités de lobbying (environ 100K activités) et les lois du Sénat (envrion 6000 lois).
+        Elle utilise les données ouvertes HATVP sur les activités de lobbying et les décisions publiques Légifrance/Tricoteuses (lois, décrets, ordonnances et arrêtés ; amendements exclus).
 
         L'application est à un stade d'expérimentation, et évolue en fonction des retours de ses utilisateurs.
         Elle est développée par Vincent Castaignet, un data analyst/scientist freelance.
@@ -247,7 +259,7 @@ with st.expander("ℹ️ Comment ça marche ?", expanded=False):
         st.markdown("""
         • écrire les mots clés recherchés ou les phrases dans le formulaire "mots-clés / requête", puis cliquer sur "Lancer" pour obtenir les résultats de recherche  
         • lire les résultats (objet_activite), et dé-sélectionner les activités qui ne sont pas pertinentes (colonne "Sélection"), puis cliquer sur "Valider la sélection" pour confirmer les activités retenues  
-        • faire de même pour les lois correspondant à la recherche (dé-sélectionner les lois non pertinentes, puis valider)  
+        • faire de même pour les décisions publiques correspondant à la recherche (dé-sélectionner les éléments non pertinents, puis valider)  
         • explorer les différentes visualisations (matrice à bulles, frise chronologique)  
         • dans l'onglet "Synthèse", cliquer sur "Générer la synthèse" pour obtenir une synthèse textuelle des activités de lobbying retenues, par un modèle de langage (LLM)  
         • utiliser les filtres pour ajuster la recherche: nombre de résultats demandés, budget, période  
@@ -414,8 +426,8 @@ else:
         figm.update_layout(height=max(650, 28 * cell["beneficiaire"].nunique() + 200))
         st.plotly_chart(figm, use_container_width=True)
 
-st.markdown("### Lois correspondant à la recherche")
-topn_laws = st.slider("Nombre de lois", 5, 200, 20, 5)
+st.markdown("### Décisions publiques correspondant à la recherche")
+topn_laws = st.slider("Nombre de décisions publiques", 5, 200, 20, 5)
 lois_res = search_lois(st.session_state.get("last_query", ""), int(topn_laws))
 show_laws = lois_res.copy()
 if not show_laws.empty:
@@ -426,7 +438,9 @@ if not show_laws.empty:
     laws_display = show_laws.rename(columns={"hybrid_score": "score de pertinence"})
     law_column_order = [
         "selected",
+        "type_decision",
         "Titre",
+        "Description",
         "Numéro de la loi",
         "Thèmes",
         "Date initiale",
@@ -446,9 +460,9 @@ if not show_laws.empty:
     selected_lois = edited_laws.loc[edited_laws["selected"] == True].drop(columns=["selected"], errors="ignore").copy()
 else:
     selected_lois = pd.DataFrame()
-    st.info("Aucune loi trouvée.")
+    st.info("Aucune décision publique trouvée.")
 
-st.markdown("### Chronologie activités & lois")
+st.markdown("### Chronologie activités & décisions publiques")
 acts = analytics.table_activites.copy()
 acts["date_evt"] = pd.to_datetime(acts.get("date_publication_activite"), errors="coerce")
 acts = acts.dropna(subset=["date_evt"])
@@ -477,10 +491,17 @@ if not laws.empty:
             x=laws["x"],
             y=laws["date_evt"],
             mode="markers",
-            name="Lois",
+            name="Décisions publiques",
             marker=dict(size=10, symbol="square", color=[color_map[t] for t in laws["theme"]]),
-            customdata=np.stack([laws["label_full"], laws["theme"]], axis=1),
-            hovertemplate="<b>Loi</b><br>%{customdata[0]}<br>Thème: %{customdata[1]}<extra></extra>",
+            customdata=np.stack(
+                [
+                    laws["label_full"].astype(str).to_numpy(),
+                    laws.get("Description", pd.Series([""] * len(laws))).fillna("").astype(str).to_numpy(),
+                    laws["theme"].astype(str).to_numpy(),
+                ],
+                axis=1,
+            ),
+            hovertemplate="<b>Décision publique</b><br>%{customdata[0]}<br>Description: %{customdata[1]}<br>Thème: %{customdata[2]}<extra></extra>",
         )
     )
 if not acts.empty:
@@ -495,7 +516,7 @@ if not acts.empty:
             hovertemplate="<b>Activité</b><br>%{customdata[0]}<br>%{customdata[1]}<br>Domaines: %{customdata[2]}<extra></extra>",
         )
     )
-figt.update_layout(height=900, xaxis_title="Lois ← | → Activités", yaxis_title="Date")
+figt.update_layout(height=900, xaxis_title="Décisions publiques ← | → Activités", yaxis_title="Date")
 st.plotly_chart(figt, use_container_width=True)
 
 st.markdown("### Synthèse des résultats")

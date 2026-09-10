@@ -1,0 +1,49 @@
+name: Synchroniser LobbySearch
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * *"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer LobbySearch (build complet)
+        run: pip install -r requirements.txt
+
+      - name: Vérifier Docker
+        run: docker version
+
+      - name: Produire les données HATVP nettoyées via Docker Tricoteuses
+        run: python scripts/fetch_tricoteuses.py --strict
+
+      - name: Importer les décisions publiques Canutes/Légifrance
+        env:
+          TRICOTEUSES_DECISIONS_API_URL: ${{ vars.TRICOTEUSES_DECISIONS_API_URL }}
+          TRICOTEUSES_DECISIONS_API_TOKEN: ${{ secrets.TRICOTEUSES_DECISIONS_API_TOKEN }}
+        run: python scripts/import_decisions_tricoteuses.py
+
+      - name: Importer HATVP puis reconstruire atomiquement Parquet/BM25/FAISS
+        env:
+          CI: "true"
+        run: python scripts/sync_all.py --no-fetch-hatvp --no-fetch-decisions
+
+      - name: Vérifier l'alignement HATVP + décisions + artefacts
+        run: python scripts/verify_alignment.py
+
+      - name: Publier le snapshot construit comme artefact Forgejo
+        uses: actions/upload-artifact@v4
+        with:
+          name: lobbysearch-generated
+          path: |
+            artifacts/
+            data/imported/
+            data/decisions/
+          if-no-files-found: error

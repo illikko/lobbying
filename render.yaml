@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: lobbysearch-bm25-test
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements-render.txt && python -m scripts.check_serving_snapshot
+    startCommand: streamlit run app_serving_test.py --server.address=0.0.0.0 --server.port=$PORT --server.headless=true --server.fileWatcherType=none
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: LOBBYSEARCH_ARTIFACTS_DIR
+        value: ./artifacts
+      - key: LOBBYSEARCH_PREBUILT_ONLY
+        value: "1"
+      - key: LOBBYSEARCH_ENABLE_LLM
+        value: "1"
+      - key: OPENAI_API_KEY
+        sync: false

@@ -145,6 +145,7 @@ TRICOTEUSES_DECISIONS_PAGE_SIZE=1000
 
 LOBBYSEARCH_ARTIFACTS_DIR=./artifacts
 TRICOTEUSES_DECISIONS_FILE=./data/decisions/decisions.parquet
+
 ```
 
 Notes :
@@ -193,6 +194,57 @@ Options utiles :
 
 `app_serving.py` peut exploiter FAISS si les artefacts et dépendances correspondants sont disponibles.
 
+
+## Déploiement de test sur Render (BM25, sans reconstruction)
+
+Le fichier `render.yaml` configure un Web Service Python sur le plan **Free**,
+avec `app_serving_test.py` et `requirements-render.txt` (sans Torch, FAISS ni
+sentence-transformers). La synthèse LLM reste disponible au clic ; renseigner
+`OPENAI_API_KEY` dans les variables secrètes Render. La clé n'est pas nécessaire
+à la recherche BM25. Les appels de synthèse sont facturés séparément par le
+fournisseur de l'API.
+
+Avant publication, inclure dans le commit les fichiers de configuration, le code
+et les huit artefacts préconstruits du **même snapshot** :
+
+```text
+artifacts/df_activites_min.parquet
+artifacts/df_lois_min.parquet
+artifacts/bm25_activites.joblib
+artifacts/bm25_lois.joblib
+artifacts/df_observations.parquet
+artifacts/df_beneficiaires.parquet
+artifacts/df_affiliations.parquet
+artifacts/df_informations_generales.parquet
+```
+
+Les artefacts déjà suivis par Git doivent être publiés dans leur version locale
+souhaitée ; `.gitignore` ne retire pas les fichiers déjà suivis. Une exception
+autorise aussi l'ajout de `df_informations_generales.parquet`.
+Les données sources, `docs_*.parquet`, les embeddings et les index FAISS ne sont
+pas nécessaires à ce service.
+
+Créer un Blueprint Render depuis le dépôt et sélectionner `render.yaml`.
+Pour configurer un service manuellement, reprendre les commandes et variables
+de ce fichier. Le build installe les dépendances puis vérifie la présence des
+artefacts (`python -m scripts.check_serving_snapshot`) ; il n'exécute aucun
+pipeline de données.
+
+Avec `LOBBYSEARCH_PREBUILT_ONLY=1`, l'application charge uniquement
+`LOBBYSEARCH_ARTIFACTS_DIR` et contrôle les identifiants des index. Un fichier
+absent ou des identifiants incohérents arrêtent le chargement avec un message
+d'erreur, sans repli vers les CSV, les données importées ou le snapshot historique,
+et sans construction de BM25. Ce contrôle des identifiants ne remplace pas la
+publication d'un snapshot cohérent (il ne compare pas le contenu textuel).
+Le mode local habituel reste disponible sans cette variable.
+
+Le plan gratuit dispose de 512 Mo de RAM : la taille compressée des Parquet ne
+permet pas de prédire la mémoire consommée. Vérifier les métriques Render au
+démarrage et lors des recherches avant de considérer le corpus complet comme
+compatible. Aucun passage automatique à un plan payant n'est configuré.
+Les artefacts livrés avec le déploiement ne nécessitent pas de disque persistant.
+Voir les [limites Render Free](https://render.com/docs/free).
+
 ## Scripts principaux
 
 ### `scripts/fetch_tricoteuses.py`
@@ -205,7 +257,7 @@ Transforme les JSON HATVP en tables relationnelles Parquet dans `data/imported/`
 
 ### `scripts/import_decisions_tricoteuses.py`
 
-Interroge l'API Canutes/Légifrance et produit `data/decisions/decisions.parquet`.
+Interroge l'API Canutes/Légifrance et produit `data/decisions/decisions.parquet`, avec une colonne `Description` extraite en priorité depuis les notices des textes quand elle est disponible.
 
 ### `scripts/sync_local_bm25.py`
 

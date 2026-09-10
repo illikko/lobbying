@@ -1,0 +1,36 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.conda/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS / caches
+.DS_Store
+Thumbs.db
+*.log
+.ipynb_checkpoints/
+.cache/
+
+# Données et artefacts reconstruisibles par la CI Forgejo
+data/tricoteuses/
+data/imported/
+data/decisions/
+artifacts/*
+!artifacts/README.md
+!artifacts/df_informations_generales.parquet
+
+# Scripts locaux
+scripts_local/
+*.bat

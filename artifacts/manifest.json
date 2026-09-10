@@ -1,20 +1,28 @@
 {
-  "built_at": "2026-05-07T19:03:16.290823Z",
+  "built_at": "2026-08-14T19:47:24.481077Z",
+  "source_fingerprint": "75e48fe9c8f82323235be03d57cf932128aac6bc3a7f025e525460049d981248",
+  "hatvp_source_fingerprint": "a80818f1ef327306726b0bb30c1dde58088e2355755da854cc8bfa8804c3ae16",
+  "decisions_source_fingerprint": "427465c43c51b1ae23ac8fdbaa8752f93c021011836e54aaa2bc2ae99bc849f5",
+  "source_imported_at": "2026-08-14T17:42:30.460283+00:00",
   "config": {
     "st_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     "nlist": 2048,
     "m": 32,
     "nbits": 8,
     "normalize": true,
-    "created_by": "build_artifacts.py"
+    "created_by": "build_artifacts.py",
+    "include_faiss": false
   },
+  "search_indexes": [
+    "bm25"
+  ],
   "counts": {
-    "activites": 111322,
-    "lois": 2239,
-    "docs_activites": 111322,
-    "affiliations": 7450,
-    "beneficiaires": 248362,
-    "observations": 111332
+    "activites": 112439,
+    "decisions_publiques": 110126,
+    "docs_activites": 112439,
+    "affiliations": 7526,
+    "beneficiaires": 249594,
+    "observations": 112449
   },
   "files": {
     "df_activites_min": "df_activites_min.parquet",
@@ -23,6 +31,7 @@
     "bm25_activites": "bm25_activites.joblib",
     "faiss_activites": "faiss_activites.index",
     "id_map_activites": "id_map_activites.parquet",
+    "df_informations_generales": "df_informations_generales.parquet",
     "df_affiliations": "df_affiliations.parquet",
     "df_beneficiaires": "df_beneficiaires.parquet",
     "df_observations": "df_observations.parquet",

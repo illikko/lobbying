@@ -1,10 +1,11 @@
 from __future__ import annotations
-import os
 from openai import OpenAI
+from src.config import OPENAI_API_KEY, OPENAI_MODEL
 import json
 
-def summarize_activites(info_llm: list[dict], model: str = "gpt-4o-mini") -> str:
-    api_key = os.environ.get("OPENAI_API_KEY")
+def summarize_activites(info_llm: list[dict], model: str | None = None) -> str:
+    api_key = OPENAI_API_KEY
+    model = model or OPENAI_MODEL
     if not api_key:
         return "OPENAI_API_KEY manquant. Impossible de générer la synthèse."
 
